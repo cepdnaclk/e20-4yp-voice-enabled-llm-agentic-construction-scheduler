@@ -51,7 +51,9 @@ class ConstructionIntent(BaseModel):
         description="Specific building type (e.g., 'single-family home', 'office building', 'warehouse')"
     )
     size: dict = Field(
-        description="Project size with units", example={"value": 5000, "unit": "sq_ft"}
+        default=...,
+        description="Project size with units",
+        examples=[{"value": 5000, "unit": "sq_ft"}],
     )
     floors: int | None = Field(None, description="Number of floors/stories")
     location: str | None = Field(None, description="Project location if specified")
@@ -141,25 +143,54 @@ class AgenticSchedulerModel:
             model=self.llm,
         )
 
-        def intent_node(state: AgentState) -> AgentState:
-            result = intent_agent.invoke(state)
-            messages = result["messages"]
-            last_msg = messages[-1]
+        def agent_router(
+            state: AgentState,
+        ) -> Literal["intent_agent", "phase_agent", "details_agent"]:
 
-            intent_phase_tool_calls = []
+            current_stage = state["current_stage"]
+
+            if current_stage == WorkflowStage.INTENT.value:
+                return "intent_agent"
+            elif current_stage == WorkflowStage.PHASES.value:
+                return "phase_agent"
+            elif current_stage == WorkflowStage.DETAILS.value:
+                return "details_agent"
+            else:
+                return "intent_agent"
+
+        def extract_toolcall(messages, toolname: str):
+
+            tool_calls = []
 
             for msg in messages:
                 if hasattr(msg, "tool_calls") and msg.tool_calls:
                     for i, tc in enumerate(msg.tool_calls):
-                        if tc["name"] == "submit_construction_intent":
-                            intent_phase_tool_calls.append(
-                                {"tool_call": tc, "messages": msg}
-                            )
+                        if tc["name"] == toolname:
+                            tool_calls.append({"tool_call": tc, "messages": msg})
+
+            return tool_calls
+
+        def intent_node(state: AgentState) -> AgentState | Command:
+
+            print("\n===== INTENT NODE =====\n")
+
+            result = intent_agent.invoke(state)  # type: ignore
+            messages = result["messages"]
+            last_message = messages[-1]
+
+            if hasattr(last_message, "content") and last_message.content:
+                print(f"\n🤖 Assistant: {last_message.content}")
+
+            intent_phase_tool_calls = extract_toolcall(
+                messages, "submit_construction_intent"
+            )
 
             if intent_phase_tool_calls:
                 tool_data = intent_phase_tool_calls[-1]  # Get the last tool call
                 tool_call = tool_data["tool_call"]
                 messages = tool_data["messages"]
+                user_response_lower = None
+                structured_intent = None
 
                 if tool_call["name"] == "submit_construction_intent":
 
@@ -199,38 +230,48 @@ class AgenticSchedulerModel:
 
                 if user_response_lower in [
                     "yes",
-                    "y",
-                    "correct",
                     "confirm",
-                    "confirmed",
-                    "looks good",
                 ]:
                     print(f"✓ Intent confirmed by user")
-                    return {
-                        "messages": [],
-                        "sender": "intent_agent",
-                        "current_stage": WorkflowStage.PHASES.value,
-                        "phases": state.get("phases", None),
-                        "user_intent": structured_intent.model_dump(),
-                        "intent_summary": intent_summary,
-                    }
+
+                    msg = None
+                    user_intent = None
+                    if structured_intent:
+                        user_intent = structured_intent.model_dump()
+                        msg = f"List the major tasks in construction of {user_intent}"
+
+                    return Command(
+                        update={
+                            "messages": [],
+                            "sender": "intent_agent",
+                            "current_stage": WorkflowStage.PHASES.value,
+                            "user_intent": user_intent,
+                            "phases": [],
+                            "current_phase_index": None,
+                        },
+                    )
 
                 elif user_response_lower in ["cancel", "start over", "reset"]:
-                    from langchain_core.messages import RemoveMessage
-                    from langgraph.graph.message import REMOVE_ALL_MESSAGES
-
                     print("User cancelled - restarting intent gathering")
+
+                    # Add a system message explaining the restart
+                    restart_msg = AIMessage(
+                        content="No problem! Let's start fresh. What type of construction project would you like to plan?"
+                    )
+
+                    # Reset the DATA but keep conversation history
                     return {
-                        "messages": [],  # Clear messages to start fresh
+                        "messages": messages + [restart_msg],  # Add restart message
                         "sender": "intent_agent",
                         "current_stage": WorkflowStage.INTENT.value,
-                        "phases": state.get("phases", None),
-                        "user_intent": None,
+                        "user_intent": None,  # Clear structured data
+                        "phases": [],
+                        "current_phase_index": None,
                     }
 
                 else:
                     # User wants corrections
-                    print(f"User requested corrections: {user_response}")
+                    print(f"User requested corrections: {user_response_lower}")
                     from langchain_core.messages import HumanMessage, ToolMessage
 
                     # Send tool result and user correction
@@ -239,21 +280,26 @@ class AgenticSchedulerModel:
                         tool_call_id=tool_call["id"],
                     )
                     correction_msg = HumanMessage(
-                        content=f"Please update the project details based on this feedback: {user_response}"
+                        content=f"Please update the project details based on this feedback: {user_response_lower}"
                     )
 
                     return {
-                        "messages": [tool_msg, correction_msg],
+                        "messages": messages + [tool_msg, correction_msg],
                         "sender": "intent_agent",
                         "current_stage": WorkflowStage.INTENT.value,
                         "phases": state.get("phases", None),
                         "user_intent": None,
+                        "current_phase_index": None,
                     }
 
             else:
                 return {
-                    "messages": [last_msg],
+                    "messages": [last_message],
+                    "sender": "intent_agent",
                     "current_stage": WorkflowStage.INTENT.value,
+                    "phases": state.get("phases", None),
+                    "user_intent": None,
+                    "current_phase_index": None,
                 }
 
         # Create Phase Agent
@@ -272,59 +318,89 @@ class AgenticSchedulerModel:
             model=self.llm,
         )
 
-        def phase_node(state: AgentState) -> AgentState:
-            result = phase_agent.invoke(state)
-            last_msg = result["messages"][-1]
+        def phase_node(state: AgentState) -> AgentState | Command:
 
-            print("=== CURRENT STATE ===")
-            # print(f"Full state: {state}")
-            # print(f"Messages: {state.get('messages', [])}")
-            # print(f"Number of messages: {len(state.get('messages', []))}")
-            # print(f"Current stage: {state.get('current_stage', 'N/A')}")
-            # print(f"Phases: {state.get('phases', [])}")
-            # print(f"Current phase index: {state.get('current_phase_index', 0)}")
-            # print(f"Sender: {state.get('sender', 'N/A')}")
-            print(f"User Intent: {state.get('user_intent', 'N/A')}")
-            print("=====================")
+            print("\n===== PHASE NODE =====\n")
 
-            # Check if tool was called and update state accordingly
-            if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
-                for tool_call in last_msg.tool_calls:
-                    if tool_call["name"] == "confirm_phases":
-                        # Extract phases from tool input
-                        import json
+            sender = state["sender"]
 
-                        tool_input = json.loads(tool_call["args"])
-                        phases_list = tool_input["phases_list"]
-                        phases = [p.strip() for p in phases_list.split(",")]
+            if sender == "intent_agent":
+                user_intent = state["user_intent"]
+                initial_msg = HumanMessage(
+                    content=f"List the major tasks in construction of {user_intent}"
+                )
+                result = phase_agent.invoke({"messages": initial_msg})  # type: ignore
+                messages = result["messages"]
+                last_message = messages[-1]
 
-                        # Update the state
+                if hasattr(last_message, "content") and last_message.content:
+                    print(f"\n🤖 Assistant: {last_message.content}")
 
-                        # Interrupt for Phase Confirmation
-                        phase_approval = interrupt(
-                            f"Do you approve these phases? {phases}"
+                return {
+                    "messages": [last_message],
+                    "sender": "phase_agent",
+                    "current_stage": WorkflowStage.PHASES.value,
+                    "phases": [],
+                    "user_intent": state.get("user_intent", ""),
+                    "current_phase_index": None,
+                }
+
+            result = phase_agent.invoke(state)  # type: ignore
+            messages = result["messages"]
+            last_message = messages[-1]
+
+            if hasattr(last_message, "content") and last_message.content:
+                print(f"\n🤖 Assistant: {last_message.content}")
+
+            phases_tool_calls = extract_toolcall(messages, "confirm_phases")
+
+            if phases_tool_calls:
+                tool_data = phases_tool_calls[-1]  # Get the last tool call
+                tool_call = tool_data["tool_call"]
+                messages = tool_data["messages"]
+                user_response_lower = None
+                structured_intent = None
+
+                if tool_call["name"] == "confirm_phases":
+
+                    phases = tool_call["args"]["phases_list"]
+
+                    # Interrupt for Phase Confirmation
+                    user_response = interrupt(f"Do you approve these phases? {phases}")
+
+                    user_response_lower = (
+                        user_response.lower().strip() if user_response else ""
+                    )
+
+                    if user_response_lower in ["yes", "confirm"]:
+                        print(f"✓ Phases confirmed by user")
+
+                        return Command(
+                            update={
+                                "messages": [last_message],
+                                "sender": "phase_agent",
+                                "current_stage": WorkflowStage.DETAILS.value,
+                                "phases": phases,
+                                "user_intent": state.get("user_intent", ""),
+                                "current_phase_index": 0,  # Reset to first phase
+                            }
                         )
-                        print(f"Phase approval: {phase_approval}")
-
-                        return {
-                            "messages": [last_msg],  # Keep the tool message
-                            "current_stage": state["current_stage"],
-                            "phases": phases,  # UPDATE STATE HERE
-                            "current_phase_index": WorkflowStage.PHASES.value,  # Reset to first phase
-                        }
 
             # No tool call, return state as-is
+
             return {
-                "messages": [last_msg],
-                "current_stage": state["current_stage"],
-                "phases": state.get("phases", []),
-                "current_phase_index": WorkflowStage.PHASES.value,
+                "messages": [last_message],
+                "sender": "phase_agent",
+                "current_stage": WorkflowStage.PHASES.value,
+                "phases": state.get("phases", None),
+                "user_intent": state.get("user_intent", ""),
+                "current_phase_index": None,
             }
 
         # Create Details Agent
         def get_details_agent_system_message(state: AgentState):
             phases = state.get("phases", [])
-            current_phase_index = state.get("current_phase_index", 0)
+            current_phase_index = state.get("current_phase_index", 0) or 0
             current_phase = (
                 phases[current_phase_index]
                 if phases and current_phase_index < len(phases)
@@ -340,7 +416,7 @@ class AgenticSchedulerModel:
             - If this is the last phase, use the 'finalize_schedule' tool to complete the workflow.
             """
 
-        def details_node(state: AgentState) -> AgentState:
+        def details_node(state: AgentState) -> AgentState | dict:
             # Create agent with dynamic system message
             details_agent = create_agent(
                 system_prompt=get_details_agent_system_message(state),
@@ -348,7 +424,7 @@ class AgenticSchedulerModel:
                 model=self.llm,
             )
 
-            result = details_agent.invoke(state)
+            result = details_agent.invoke(state)  # type: ignore
 
             if isinstance(result, dict) and "messages" in result:
                 return {
@@ -368,46 +444,9 @@ class AgenticSchedulerModel:
                 }
 
         def scheduling_node(state: AgentState) -> AgentState:
-            print(self.current_task)
             final_approval = interrupt("Requesting final schedule approval.")
             print(f"Final Schedule Approval: {final_approval}")
-
-        # Define proper routing logic
-        def should_continue(
-            state: AgentState,
-        ) -> Literal["next_phase", "continue_details", "end"]:
-            messages = state["messages"]
-            last_message = messages[-1]
-
-            # Check if workflow should end
-            if any(
-                term in last_message.content.upper()
-                for term in ["FINAL ANSWER", "COMPLETED", "SCHEDULE FINALIZED"]
-            ):
-                return "end"
-
-            # Check if we should move to next phase or stay in details
-            current_phase_index = state.get("current_phase_index", 0)
-            phases = state.get("phases", [])
-
-            if (
-                current_phase_index >= len(phases) - 1
-                and "finalize" in last_message.content.lower()
-            ):
-                return "end"
-            elif (
-                "next phase" in last_message.content.lower()
-                or "complete phase" in last_message.content.lower()
-            ):
-                return "next_phase"
-            else:
-                return "continue_details"
-
-        def route_after_phases(state: AgentState) -> Literal["details_agent", "end"]:
-            phases = state.get("phases", [])
-            if phases:
-                return "details_agent"
-            return "end"
+            return state
 
         # Build the workflow with proper state
         workflow = StateGraph(AgentState)
@@ -417,34 +456,22 @@ class AgenticSchedulerModel:
         workflow.add_node("details_agent", details_node)
         workflow.add_node("scheduling_agent", scheduling_node)
 
-        workflow.add_edge(START, "intent_agent")
-        workflow.add_edge("intent_agent", "phase_agent")
-
-        # Conditional routing after phases
         workflow.add_conditional_edges(
-            "phase_agent",
-            route_after_phases,
-            {"details_agent": "details_agent", "end": END},
-        )
-
-        # Conditional routing in details phase
-        workflow.add_conditional_edges(
-            "details_agent",
-            should_continue,
+            START,
+            agent_router,
             {
-                "continue_details": "details_agent",
-                "next_phase": "details_agent",  # Stay in details but with updated phase index
-                "end": "scheduling_agent",
+                "intent_agent": "intent_agent",
+                "phase_agent": "phase_agent",
+                "details_agent": "details_agent",  # Add if needed
+                "END": END,  # Add option to end directly if needed
             },
         )
-
+       
         workflow.add_edge("scheduling_agent", END)
 
-        return workflow.compile(
-            checkpointer=MemorySaver(), interrupt_before=["phase_agent"]
-        )
+        return workflow.compile(checkpointer=MemorySaver())
 
-    def extract_interrupt_message(state):
+    def extract_interrupt_message(self, state):
         """Helper to extract interrupt message from state"""
         if state.tasks:
             for task in state.tasks:
@@ -455,60 +482,67 @@ class AgenticSchedulerModel:
         return None
 
     def chat_with_model(self):
-        print("🚀 AI Assistant Started! (Hierarchical Mode)")
-        print("💡 Available functions: Construction scheduling")
+        print("🚀 AI Assistant Started!")
         print("-" * 60)
 
-        # Create a thread ID for the conversation
+        # Create a thread ID
         thread_id = str(uuid.uuid4())
-        config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 50}
+        config = RunnableConfig(
+            configurable={"thread_id": thread_id}, recursion_limit=50
+        )
 
-        # Get initial user input
-        user_input = input("\n👤 You: ").strip()
+        print(f"Thread ID: {thread_id}")
 
-        while user_input.lower() not in ["exit", "quit", "bye"]:
+        # START with initial state ONLY ONCE
+        initial_state: AgentState = {
+            "messages": [HumanMessage(content="Hi", config=config)],
+            "sender": "user",
+            "current_stage": WorkflowStage.INTENT.value,
+            "phases": [],
+            "user_intent": None,
+            "current_phase_index": None,
+        }
+
+        # Initial invoke with empty state
+        self.workflow.invoke(initial_state, config=config)
+
+        while True:
+            input_from_interrupt = False
+            user_input = None
             try:
-                # Invoke the graph with user input
-                result = self.workflow.invoke(
-                    {"messages": [HumanMessage(content=user_input)]}, config=config
-                )
-
-                # Display assistant's response
-                if result.get("messages"):
-                    last_message = result["messages"][-1]
-                    if hasattr(last_message, "content") and last_message.content:
-                        print(f"\n🤖 Assistant: {last_message.content}")
-
-                # Check if graph is waiting for more input
+                # Check for interrupts FIRST
                 state_snapshot = self.workflow.get_state(config)
 
-                if state_snapshot.next:
-                    if state_snapshot.tasks:
-                        for task in state_snapshot.tasks:
-                            if hasattr(task, "interrupts") and task.interrupts:
-                                for item in task.interrupts:
-                                    print(f"\n🤖 Assistant: {item.value}")
+                if state_snapshot.tasks:
+                    for task in state_snapshot.tasks:
+                        if hasattr(task, "interrupts") and task.interrupts:
+                            for item in task.interrupts:
+                                print(f"\n🤖 Assistant: {item.value}")
 
-                                    # Get user's response
-                                    user_input = input("\n👤 You: ").strip()
+                                # Get user response to interrupt
+                                input_from_interrupt = True
+                                user_input = input("\n👤 You: ").strip()
 
-                                    # Resume with their response
-                                    self.workflow.invoke(
-                                        Command(
-                                            resume=user_input
-                                        ),  # Pass response back to interrupt()
-                                        config=config,
-                                    )
+                                # Resume with JUST the response
+                                self.workflow.invoke(
+                                    Command(resume=user_input), config=config
+                                )
+                                continue
 
-                                    continue
-                    else:
-                        pass
-                else:
-                    # Graph completed this turn
-                    print("[Turn complete]")
+                # No interrupt? Get normal user input
+                if not input_from_interrupt:
+                    user_input = input("\n👤 You: ").strip()
+                    input_from_interrupt = False
 
-                # Get next user input
-                user_input = input("\n👤 You: ").strip()
+                if user_input and user_input.lower() in ["exit", "quit", "bye"]:
+                    print("👋 Goodbye!")
+                    break
+
+                # Send ONLY the new message, not full state
+                self.workflow.invoke(
+                    {"messages": [HumanMessage(content=user_input)]},  # type: ignore
+                    config=config,
+                )
 
             except KeyboardInterrupt:
                 print("\n👋 Goodbye!")
