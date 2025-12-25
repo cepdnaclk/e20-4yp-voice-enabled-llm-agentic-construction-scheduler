@@ -7,9 +7,9 @@ import uuid
 from pydantic.main import BaseModel
 from langgraph.types import Command, interrupt
 from enum import Enum
-from typing import Sequence, Annotated, TypedDict, Literal
+from typing import Sequence, Annotated, TypedDict, Literal, List
 from dotenv import load_dotenv
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -86,6 +86,65 @@ class ConstructionIntent(BaseModel):
             summary += f"\nBudget: {self.budget_range}"
         return summary
 
+
+class Dependency(BaseModel):
+    """Represents a task dependency with relationship and lag"""
+
+    previous_task: str = Field(..., description="Name of the previous task")
+    relationship: str = Field(
+        ..., description="Relationship type (e.g., 'FS', 'SS', 'FF', 'SF')"
+    )
+    lag_days: int = Field(default=0, description="Lag time in days")
+
+    @classmethod
+    def from_list(cls, dep_list: List) -> "Dependency":
+        """Create from [previous_task, relationship, lag] format"""
+        return cls(
+            previous_task=dep_list[0],
+            relationship=dep_list[1],
+            lag_days=dep_list[2] if len(dep_list) > 2 else 0,
+        )
+
+
+class Resource(BaseModel):
+    """Represents a required resource"""
+
+    name: str = Field(..., description="Resource name")
+    amount: float = Field(..., description="Required amount/quantity")
+
+    @classmethod
+    def from_list(cls, res_list: List) -> "Resource":
+        """Create from [resource_name, amount] format"""
+        return cls(name=res_list[0], amount=res_list[1])
+
+
+class Task(BaseModel):
+    """Represents a single task in the project schedule"""
+
+    name: str = Field(..., description="Task name")
+    duration_days: int = Field(..., gt=0, description="Duration in days")
+    dependencies: List[List] = Field(
+        default_factory=list,
+        description="List of dependencies as [previous_task, relationship, lag]",
+    )
+    resources: List[List] = Field(
+        default_factory=list, description="List of resources as [resource_name, amount]"
+    )
+
+    def get_dependencies(self) -> List[Dependency]:
+        """Parse dependencies into Dependency objects"""
+        return [Dependency.from_list(dep) for dep in self.dependencies]
+
+    def get_resources(self) -> List[Resource]:
+        """Parse resources into Resource objects"""
+        return [Resource.from_list(res) for res in self.resources]
+
+
+class TaskList(BaseModel):
+    """Collection of tasks for a project phase"""
+
+    tasks: List[Task] = Field(..., description="List of tasks")
+    
 
 class AgenticSchedulerModel:
 
@@ -318,7 +377,7 @@ class AgenticSchedulerModel:
             model=self.llm,
         )
 
-        def phase_node(state: AgentState) -> AgentState | Command:
+        def phase_node (state: AgentState) -> AgentState | Command:
 
             print("\n===== PHASE NODE =====\n")
 
@@ -366,7 +425,7 @@ class AgenticSchedulerModel:
                     phases = tool_call["args"]["phases_list"]
 
                     # Interrupt for Phase Confirmation
-                    user_response = interrupt(f"Do you approve these phases? {phases}")
+                    user_response = interrupt(f"Do you approve these phases?")
 
                     user_response_lower = (
                         user_response.lower().strip() if user_response else ""
@@ -398,50 +457,49 @@ class AgenticSchedulerModel:
             }
 
         # Create Details Agent
-        def get_details_agent_system_message(state: AgentState):
-            phases = state.get("phases", [])
-            current_phase_index = state.get("current_phase_index", 0) or 0
-            current_phase = (
-                phases[current_phase_index]
-                if phases and current_phase_index < len(phases)
-                else "Unknown"
-            )
-
-            return f"""
-            You are a construction scheduling assistant. You are currently detailing the phase: '{current_phase}'.
+        DETAIL_AGENT_SYSTEM_PROMPT = """
+            You are a construction scheduling assistant.
             - Identify the tasks and dependencies and required resources for this phase.
             - Ask the user if you have any vague tasks.
-            - Use 'save_tasks' to save the identified tasks.
-            - Once the user is satisfied with this phase, use the 'complete_current_phase' tool to move to the next phase.
-            - If this is the last phase, use the 'finalize_schedule' tool to complete the workflow.
             """
+        details_agent = create_agent(
+            system_prompt=DETAIL_AGENT_SYSTEM_PROMPT,
+            tools=details_tools,
+            model=self.llm,
+            response_format=TaskList
+        )
 
         def details_node(state: AgentState) -> AgentState | dict:
-            # Create agent with dynamic system message
-            details_agent = create_agent(
-                system_prompt=get_details_agent_system_message(state),
-                tools=details_tools,
-                model=self.llm,
-            )
 
-            result = details_agent.invoke(state)  # type: ignore
+            print("\n===== DETAILS NODE =====\n")
 
-            if isinstance(result, dict) and "messages" in result:
+            sender = state["sender"]
+
+            if sender == "phase_agent":
+                phases = state["phases"]
+                initial_msg = SystemMessage(
+                    content=f"You are currently detailing the major construction phases [{phases}]"
+                )
+                result = details_agent.invoke({"messages": initial_msg})  # type: ignore
+                messages = result["messages"]
+                last_message = messages[-1]
+
+                # TODO - remove print
+                # print(f"\n{result}")
+
+                if hasattr(last_message, "content") and last_message.content:
+                    print(f"\n🤖 Assistant: {last_message.content}")
+
                 return {
-                    "messages": result["messages"],
+                    "messages": [last_message],
+                    "sender": "details_agent",
                     "current_stage": WorkflowStage.DETAILS.value,
                     "phases": state.get("phases", []),
-                    "current_phase_index": state.get("current_phase_index", 0),
+                    "user_intent": state.get("user_intent", ""),
+                    "current_phase_index": 0,
                 }
-            else:
-                return {
-                    "messages": [
-                        HumanMessage(content=str(result), name="details_agent")
-                    ],
-                    "current_stage": WorkflowStage.DETAILS.value,
-                    "phases": state.get("phases", []),
-                    "current_phase_index": state.get("current_phase_index", 0),
-                }
+
+            return state
 
         def scheduling_node(state: AgentState) -> AgentState:
             final_approval = interrupt("Requesting final schedule approval.")
@@ -466,7 +524,7 @@ class AgenticSchedulerModel:
                 "END": END,  # Add option to end directly if needed
             },
         )
-       
+
         workflow.add_edge("scheduling_agent", END)
 
         return workflow.compile(checkpointer=MemorySaver())
