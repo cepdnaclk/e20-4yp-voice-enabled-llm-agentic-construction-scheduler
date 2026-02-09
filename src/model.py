@@ -1,6 +1,5 @@
 from pydantic.fields import Field
 from typing import Optional
-from langchain.agents.structured_output import ToolStrategy
 import os
 import operator
 import uuid
@@ -12,17 +11,21 @@ from dotenv import load_dotenv
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langgraph.graph import StateGraph, START, END, MessagesState
+from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.runnables import RunnableConfig
 from langchain.agents import create_agent
 from src.tools import setup_tools, phase_tools, details_tools, intent_tools
-from langchain_opentutorial.graphs import visualize_graph
-
+from langchain_neo4j import Neo4jGraph
+from langchain_community.vectorstores import Neo4jVector
+from langchain_neo4j.chains.graph_qa.cypher import GraphCypherQAChain
+from langchain_openai import OpenAIEmbeddings
+from langchain_classic.chains.retrieval import create_retrieval_chain
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate
 
 # load the env variables from the .env file
-load_dotenv()
+load_dotenv(".env")
 
 
 class WorkflowStage(Enum):
@@ -144,17 +147,61 @@ class TaskList(BaseModel):
     """Collection of tasks for a project phase"""
 
     tasks: List[Task] = Field(..., description="List of tasks")
-    
+
 
 class AgenticSchedulerModel:
 
     def __init__(self):
         setup_tools(self)
-
+        print(os.getenv("NEO4J_URI"))
         self.llm = ChatOpenAI(
             model=os.getenv("MODEL") or "",
             api_key=SecretStr(os.getenv("OPENAI_API_KEY") or ""),
         )
+
+        self.graph = Neo4jGraph(
+            url=os.getenv("NEO4J_URI") or "",
+            username=os.getenv("NEO4J_USERNAME") or "",
+            password=os.getenv("NEO4J_PASSWORD") or "",
+            database=os.getenv("NEO4J_DATABASE") or "",
+        )
+
+        self.vector_index = Neo4jVector.from_existing_graph(
+            OpenAIEmbeddings(),
+            url=os.getenv("NEO4J_URI") or "",
+            username=os.getenv("NEO4J_USERNAME") or "",
+            password=os.getenv("NEO4J_PASSWORD") or "",
+            index_name="task",
+            node_label="Subtask",
+            text_node_properties=["name", "description"],
+            embedding_node_property="embedding",
+        )
+
+        # TODO find better alternative to allow_dangerous_requests=True
+        self.cypher_chain = GraphCypherQAChain.from_llm(
+            llm=self.llm, graph=self.graph, verbose=True, allow_dangerous_requests=True
+        )
+
+        # TODO vectorizing the graph
+        retriever = self.vector_index.as_retriever()
+
+        llm = ChatOpenAI(temperature=0)
+
+        prompt = ChatPromptTemplate.from_template(
+            """
+        Answer the question based only on the following context:
+        {context}
+
+        Question: {input}
+
+        Answer the question and provide relevant details from the context:
+        """
+        )
+
+        document_chain = create_stuff_documents_chain(llm, prompt)
+
+        self.chain = create_retrieval_chain(retriever, document_chain)
+
         self.workflow = self._build_workflow()
         self._visualize_graph()
 
@@ -215,7 +262,7 @@ class AgenticSchedulerModel:
             elif current_stage == WorkflowStage.DETAILS.value:
                 return "details_agent"
             else:
-                return "intent_agent"
+                return "phase_agent"
 
         def extract_toolcall(messages, toolname: str):
 
@@ -237,7 +284,11 @@ class AgenticSchedulerModel:
             messages = result["messages"]
             last_message = messages[-1]
 
-            if hasattr(last_message, "content") and last_message.content:
+            if (
+                last_message
+                and hasattr(last_message, "content")
+                and last_message.content
+            ):
                 print(f"\n🤖 Assistant: {last_message.content}")
 
             intent_phase_tool_calls = extract_toolcall(
@@ -359,7 +410,7 @@ class AgenticSchedulerModel:
                     "phases": state.get("phases", None),
                     "user_intent": None,
                     "current_phase_index": None,
-                }
+                }  # type: ignore
 
         # Create Phase Agent
         PHASE_AGENT_SYSTEM_PROMPT = """
@@ -377,7 +428,7 @@ class AgenticSchedulerModel:
             model=self.llm,
         )
 
-        def phase_node (state: AgentState) -> AgentState | Command:
+        def phase_node(state: AgentState) -> AgentState | Command:
 
             print("\n===== PHASE NODE =====\n")
 
@@ -422,8 +473,8 @@ class AgenticSchedulerModel:
 
                 if tool_call["name"] == "confirm_phases":
 
-                    phases = tool_call["args"]["phases_list"]
-
+                    phases_list = tool_call["args"]["phases_list"]
+                    phases = [p.strip() for p in phases_list.split(",")]
                     # Interrupt for Phase Confirmation
                     user_response = interrupt(f"Do you approve these phases?")
 
@@ -466,38 +517,51 @@ class AgenticSchedulerModel:
             system_prompt=DETAIL_AGENT_SYSTEM_PROMPT,
             tools=details_tools,
             model=self.llm,
-            response_format=TaskList
+            response_format=TaskList,
         )
 
         def details_node(state: AgentState) -> AgentState | dict:
 
             print("\n===== DETAILS NODE =====\n")
 
-            sender = state["sender"]
+            current_phase = state["current_phase_index"]
+            phases = state["phases"]
+            lastmsg = state["messages"][-1]
 
-            if sender == "phase_agent":
-                phases = state["phases"]
-                initial_msg = SystemMessage(
-                    content=f"You are currently detailing the major construction phases [{phases}]"
-                )
-                result = details_agent.invoke({"messages": initial_msg})  # type: ignore
-                messages = result["messages"]
-                last_message = messages[-1]
+            print(f"\ncurrent_phase: {current_phase}\n")
+            print(phases)
 
-                # TODO - remove print
-                # print(f"\n{result}")
+            if lastmsg.content:
+                result1 = self.cypher_chain.invoke({"query": lastmsg.content})
+                print("cypher: ", result1)
 
-                if hasattr(last_message, "content") and last_message.content:
-                    print(f"\n🤖 Assistant: {last_message.content}")
+                result = self.chain.invoke({"input": lastmsg.content})
 
-                return {
-                    "messages": [last_message],
-                    "sender": "details_agent",
-                    "current_stage": WorkflowStage.DETAILS.value,
-                    "phases": state.get("phases", []),
-                    "user_intent": state.get("user_intent", ""),
-                    "current_phase_index": 0,
-                }
+                print("vector: ", result["answer"])
+
+                result2 = self.llm.invoke((f"{lastmsg.content},be brief"))
+                print("llm: ", result2.content)
+
+            # while (not (current_phase == None)) and current_phase < len(phases):
+            #     phases = state["phases"]
+            #     msg = SystemMessage(
+            #         content=f"You are currently detailing the major construction phases [{phases[current_phase]}]"
+            #     )
+            #     result = details_agent.invoke({"messages": msg})  # type: ignore
+            #     messages = result["messages"]
+            #     last_message = messages[-1]
+
+            #     if hasattr(last_message, "content") and last_message.content:
+            #         print(f"\n🤖 Assistant: {last_message.content}")
+
+            #     return {
+            #         "messages": [last_message],
+            #         "sender": "details_agent",
+            #         "current_stage": WorkflowStage.DETAILS.value,
+            #         "phases": state.get("phases", []),
+            #         "user_intent": state.get("user_intent", ""),
+            #         "current_phase_index": current_phase + 1,
+            #     }
 
             return state
 
@@ -553,9 +617,9 @@ class AgenticSchedulerModel:
 
         # START with initial state ONLY ONCE
         initial_state: AgentState = {
-            "messages": [HumanMessage(content="Hi", config=config)],
+            "messages": [HumanMessage(content="", config=config)],
             "sender": "user",
-            "current_stage": WorkflowStage.INTENT.value,
+            "current_stage": WorkflowStage.DETAILS.value,  # TODO this should be INTENT value
             "phases": [],
             "user_intent": None,
             "current_phase_index": None,
