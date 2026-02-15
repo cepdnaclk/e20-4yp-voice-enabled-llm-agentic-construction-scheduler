@@ -42,6 +42,8 @@ class AgentState(TypedDict):
     phases: list
     user_intent: Optional[str]
     current_phase_index: Optional[int]
+    generated_tasks: Optional[dict]  # Store tasks by phase name
+    interrupt: bool
 
 
 class ConstructionIntent(BaseModel):
@@ -126,11 +128,11 @@ class Task(BaseModel):
 
     name: str = Field(..., description="Task name")
     duration_days: int = Field(..., gt=0, description="Duration in days")
-    dependencies: List[List] = Field(
+    dependencies: List[List[str]] = Field(
         default_factory=list,
         description="List of dependencies as [previous_task, relationship, lag]",
     )
-    resources: List[List] = Field(
+    resources: List[List[str]] = Field(
         default_factory=list, description="List of resources as [resource_name, amount]"
     )
 
@@ -280,6 +282,7 @@ class AgenticSchedulerModel:
 
             print("\n===== INTENT NODE =====\n")
 
+            # Normal flow - invoke the agent
             result = intent_agent.invoke(state)  # type: ignore
             messages = result["messages"]
             last_message = messages[-1]
@@ -298,7 +301,7 @@ class AgenticSchedulerModel:
             if intent_phase_tool_calls:
                 tool_data = intent_phase_tool_calls[-1]  # Get the last tool call
                 tool_call = tool_data["tool_call"]
-                messages = tool_data["messages"]
+                tool_messages = tool_data["messages"]
                 user_response_lower = None
                 structured_intent = None
 
@@ -344,11 +347,9 @@ class AgenticSchedulerModel:
                 ]:
                     print(f"✓ Intent confirmed by user")
 
-                    msg = None
                     user_intent = None
                     if structured_intent:
                         user_intent = structured_intent.model_dump()
-                        msg = f"List the major tasks in construction of {user_intent}"
 
                     return Command(
                         update={
@@ -359,30 +360,33 @@ class AgenticSchedulerModel:
                             "phases": [],
                             "current_phase_index": None,
                         },
+                        goto="phase_agent",  # Explicitly route to phase agent
                     )
 
                 elif user_response_lower in ["cancel", "start over", "reset"]:
                     print("User cancelled - restarting intent gathering")
 
                     # Add a system message explaining the restart
-                    restart_msg = AIMessage(
+                    restart_msg = SystemMessage(
                         content="No problem! Let's start fresh. What type of construction project would you like to plan?"
                     )
 
                     # Reset the DATA but keep conversation history
-                    return {
-                        "messages": messages + [restart_msg],  # Add restart message
-                        "sender": "intent_agent",
+                    return AgentState({
+                        "messages": [restart_msg],
+                        "sender": "user",  # Reset sender to trigger fresh agent call
                         "current_stage": WorkflowStage.INTENT.value,
                         "user_intent": None,  # Clear structured data
                         "phases": [],
                         "current_phase_index": None,
-                    }
+                        "generated_tasks": {},
+                        "interrupt": False
+                    } )
 
                 else:
                     # User wants corrections
                     print(f"User requested corrections: {user_response_lower}")
-                    from langchain_core.messages import HumanMessage, ToolMessage
+                    from langchain_core.messages import ToolMessage
 
                     # Send tool result and user correction
                     tool_msg = ToolMessage(
@@ -390,17 +394,17 @@ class AgenticSchedulerModel:
                         tool_call_id=tool_call["id"],
                     )
                     correction_msg = HumanMessage(
-                        content=f"Please update the project details based on this feedback: {user_response_lower}"
+                        content=f"Please update the project details based on this feedback: {user_response_lower}" 
                     )
 
                     return {
-                        "messages": messages + [tool_msg, correction_msg],
-                        "sender": "intent_agent",
+                        "messages": [tool_messages, tool_msg, correction_msg],
+                        "sender": "user",  # Reset sender so agent re-invokes
                         "current_stage": WorkflowStage.INTENT.value,
                         "phases": state.get("phases", None),
                         "user_intent": None,
                         "current_phase_index": None,
-                    }
+                    } # type: ignore
 
             else:
                 return {
@@ -446,6 +450,58 @@ class AgenticSchedulerModel:
                 if hasattr(last_message, "content") and last_message.content:
                     print(f"\n🤖 Assistant: {last_message.content}")
 
+                # Check if the agent already called confirm_phases tool
+                phases_tool_calls = extract_toolcall(messages, "confirm_phases")
+
+                if phases_tool_calls:
+                    # Agent already wants to confirm phases - use interrupt
+                    tool_data = phases_tool_calls[-1]
+                    tool_call = tool_data["tool_call"]
+                    phases_list = tool_call["args"]["phases_list"]
+                    phases = [p.strip() for p in phases_list.split(",")]
+
+                    user_response = interrupt(
+                        f"📋 Proposed Phases:\n{chr(10).join([f'  • {p}' for p in phases])}\n\n"
+                        "Do you approve these phases? (yes/no or provide changes)"
+                    )
+
+                    user_response_lower = (
+                        user_response.lower().strip() if user_response else ""
+                    )
+
+                    if user_response_lower in ["yes", "confirm"]:
+                        print(f"✓ Phases confirmed by user")
+                        return Command(
+                            update={
+                                "messages": [last_message],
+                                "sender": "phase_agent",
+                                "current_stage": WorkflowStage.DETAILS.value,
+                                "phases": phases,
+                                "user_intent": state.get("user_intent", ""),
+                                "current_phase_index": 0,
+                            }
+                        )
+                    else:
+                        # User wants changes - continue conversation
+                        from langchain_core.messages import ToolMessage
+
+                        tool_msg = ToolMessage(
+                            content="User requested changes to phases",
+                            tool_call_id=tool_call["id"],
+                        )
+                        correction_msg = HumanMessage(
+                            content=f"Please update the phases based on this feedback: {user_response}"
+                        )
+                        return {
+                            "messages": messages + [tool_msg, correction_msg],
+                            "sender": "phase_agent",
+                            "current_stage": WorkflowStage.PHASES.value,
+                            "phases": [],
+                            "user_intent": state.get("user_intent", ""),
+                            "current_phase_index": None,
+                        } # type: ignore
+
+                # No tool call yet - agent is still asking questions, wait for user input
                 return {
                     "messages": [last_message],
                     "sender": "phase_agent",
@@ -453,7 +509,7 @@ class AgenticSchedulerModel:
                     "phases": [],
                     "user_intent": state.get("user_intent", ""),
                     "current_phase_index": None,
-                }
+                } # type: ignore
 
             result = phase_agent.invoke(state)  # type: ignore
             messages = result["messages"]
@@ -505,7 +561,7 @@ class AgenticSchedulerModel:
                 "phases": state.get("phases", None),
                 "user_intent": state.get("user_intent", ""),
                 "current_phase_index": None,
-            }
+            } # type: ignore
 
         # Create Details Agent
         DETAIL_AGENT_SYSTEM_PROMPT = """
@@ -520,50 +576,105 @@ class AgenticSchedulerModel:
             response_format=TaskList,
         )
 
-        def details_node(state: AgentState) -> AgentState | dict:
-
+        def details_node(state: AgentState) -> AgentState | Command:
             print("\n===== DETAILS NODE =====\n")
 
-            current_phase = state["current_phase_index"]
+            current_phase_idx = state["current_phase_index"]
             phases = state["phases"]
-            lastmsg = state["messages"][-1]
+            user_intent = state["user_intent"]
+            generated_tasks = state.get("generated_tasks") or {}
 
-            print(f"\ncurrent_phase: {current_phase}\n")
-            print(phases)
+            # Check if all phases are complete
+            if current_phase_idx is None or current_phase_idx >= len(phases):
+                print("All phases complete, moving to scheduling")
+                return Command(
+                    update={
+                        "current_stage": WorkflowStage.SCHEDULING.value,
+                        "sender": "details_agent",
+                        "generated_tasks": generated_tasks,
+                    }
+                )
 
-            if lastmsg.content:
-                result1 = self.cypher_chain.invoke({"query": lastmsg.content})
-                print("cypher: ", result1)
+            current_phase = phases[current_phase_idx]
+            print(
+                f"Processing phase {current_phase_idx + 1}/{len(phases)}: {current_phase}"
+            )
 
-                result = self.chain.invoke({"input": lastmsg.content})
+            # Step 1: Query KG for known tasks in this phase
+            kg_query = f"What are the tasks for {current_phase} phase?"
+            try:
+                kg_result = self.cypher_chain.invoke({"query": kg_query})
+                kg_tasks = kg_result.get("result", "No template found")
+                print(f"KG Tasks: {kg_tasks}")
+            except Exception as e:
+                print(f"KG query failed: {e}")
+                kg_tasks = "No template available"
 
-                print("vector: ", result["answer"])
+            # Step 2: Use RAG for additional context
+            try:
+                rag_result = self.chain.invoke(
+                    {
+                        "input": f"What are the typical tasks for {current_phase} phase in construction?"
+                    }
+                )
+                rag_context = rag_result.get("answer", "")
+                print(f"RAG Context: {rag_context}")
+            except Exception as e:
+                print(f"RAG query failed: {e}")
+                rag_context = ""
 
-                result2 = self.llm.invoke((f"{lastmsg.content},be brief"))
-                print("llm: ", result2.content)
+            # Step 3: LLM generates detailed tasks USING KG as foundation
+            prompt = f"""
+            Generate detailed tasks for the "{current_phase}" phase of a construction project.
 
-            # while (not (current_phase == None)) and current_phase < len(phases):
-            #     phases = state["phases"]
-            #     msg = SystemMessage(
-            #         content=f"You are currently detailing the major construction phases [{phases[current_phase]}]"
-            #     )
-            #     result = details_agent.invoke({"messages": msg})  # type: ignore
-            #     messages = result["messages"]
-            #     last_message = messages[-1]
+            KNOWN TASKS FROM DATABASE (use these as foundation):
+            {kg_tasks}
 
-            #     if hasattr(last_message, "content") and last_message.content:
-            #         print(f"\n🤖 Assistant: {last_message.content}")
+            ADDITIONAL CONTEXT:
+            {rag_context}
 
-            #     return {
-            #         "messages": [last_message],
-            #         "sender": "details_agent",
-            #         "current_stage": WorkflowStage.DETAILS.value,
-            #         "phases": state.get("phases", []),
-            #         "user_intent": state.get("user_intent", ""),
-            #         "current_phase_index": current_phase + 1,
-            #     }
+            PROJECT DETAILS: {user_intent}
 
-            return state
+            Return a structured list of tasks with:
+            - name: task name
+            - duration_days: estimated duration
+            - dependencies: list of [previous_task, relationship_type, lag_days]
+            - resources: list of [resource_name, amount]
+            """
+
+            try:
+                result = self.llm.with_structured_output(TaskList).invoke(prompt)
+                phase_tasks = [task.model_dump() for task in result.tasks] # type: ignore
+                print(f"Generated {len(phase_tasks)} tasks for {current_phase}")
+
+                # Store tasks for this phase
+                generated_tasks[current_phase] = phase_tasks
+
+                response_msg = AIMessage(
+                    content=f"✅ Generated {len(phase_tasks)} tasks for {current_phase}:\n"
+                    + "\n".join(
+                        [
+                            f"  - {t['name']} ({t['duration_days']} days)"
+                            for t in phase_tasks
+                        ]
+                    )
+                )
+            except Exception as e:
+                print(f"Task generation failed: {e}")
+                response_msg = AIMessage(
+                    content=f"⚠️ Could not generate structured tasks for {current_phase}: {str(e)}"
+                )
+
+            # Move to next phase
+            return {
+                "messages": [response_msg],
+                "sender": "details_agent",
+                "current_stage": WorkflowStage.DETAILS.value,
+                "phases": phases,
+                "user_intent": user_intent,
+                "current_phase_index": current_phase_idx + 1,
+                "generated_tasks": generated_tasks,
+            } # type: ignore
 
         def scheduling_node(state: AgentState) -> AgentState:
             final_approval = interrupt("Requesting final schedule approval.")
@@ -584,11 +695,38 @@ class AgenticSchedulerModel:
             {
                 "intent_agent": "intent_agent",
                 "phase_agent": "phase_agent",
-                "details_agent": "details_agent",  # Add if needed
-                "END": END,  # Add option to end directly if needed
+                "details_agent": "details_agent",
+                "END": END,
             },
         )
 
+        # Add EXIT edges from each agent
+        def intent_exit_router(state: AgentState):
+            return (
+                "phase_agent"
+                if state["current_stage"] == WorkflowStage.PHASES.value
+                else END
+            )
+
+        def phase_exit_router(state: AgentState):
+            return (
+                "details_agent"
+                if state["current_stage"] == WorkflowStage.DETAILS.value
+                else END
+            )
+
+            
+
+        def details_exit_router(state: AgentState):
+            return (
+                "scheduling_agent"
+                if state["current_stage"] == WorkflowStage.SCHEDULING.value
+                else END
+            )
+
+        workflow.add_conditional_edges("intent_agent", intent_exit_router)
+        workflow.add_conditional_edges("phase_agent", phase_exit_router)
+        workflow.add_conditional_edges("details_agent", details_exit_router)
         workflow.add_edge("scheduling_agent", END)
 
         return workflow.compile(checkpointer=MemorySaver())
@@ -603,81 +741,82 @@ class AgenticSchedulerModel:
                             return item["value"]
         return None
 
-    def chat_with_model(self):
-        print("🚀 AI Assistant Started!")
-        print("-" * 60)
+    # def chat_with_model(self):
+    #     print("🚀 AI Assistant Started!")
+    #     print("-" * 60)
 
-        # Create a thread ID
-        thread_id = str(uuid.uuid4())
-        config = RunnableConfig(
-            configurable={"thread_id": thread_id}, recursion_limit=50
-        )
+    #     # Create a thread ID
+    #     thread_id = str(uuid.uuid4())
+    #     config = RunnableConfig(
+    #         configurable={"thread_id": thread_id}, recursion_limit=50
+    #     )
 
-        print(f"Thread ID: {thread_id}")
+    #     print(f"Thread ID: {thread_id}")
 
-        # START with initial state ONLY ONCE
-        initial_state: AgentState = {
-            "messages": [HumanMessage(content="", config=config)],
-            "sender": "user",
-            "current_stage": WorkflowStage.DETAILS.value,  # TODO this should be INTENT value
-            "phases": [],
-            "user_intent": None,
-            "current_phase_index": None,
-        }
+    #     # START with initial state ONLY ONCE
+    #     initial_state: AgentState = {
+    #         "messages": [HumanMessage(content="", config=config)],
+    #         "sender": "user",
+    #         "current_stage": WorkflowStage.INTENT.value,  # Start from INTENT
+    #         "phases": [],
+    #         "user_intent": None,
+    #         "current_phase_index": None,
+    #         "generated_tasks": {},
+    #     }
 
-        # Initial invoke with empty state
-        self.workflow.invoke(initial_state, config=config)
+    #     # Initial invoke with empty state
+    #     self.workflow.invoke(initial_state, config=config)
 
-        while True:
-            input_from_interrupt = False
-            user_input = None
-            try:
-                # Check for interrupts FIRST
-                state_snapshot = self.workflow.get_state(config)
+    #     while True:
+    #         input_from_interrupt = False
+    #         user_input = None
+    #         try:
+    #             # Check for interrupts FIRST
+    #             state_snapshot = self.workflow.get_state(config)
 
-                if state_snapshot.tasks:
-                    for task in state_snapshot.tasks:
-                        if hasattr(task, "interrupts") and task.interrupts:
-                            for item in task.interrupts:
-                                print(f"\n🤖 Assistant: {item.value}")
+    #             if state_snapshot.tasks:
+    #                 for task in state_snapshot.tasks:
+    #                     if hasattr(task, "interrupts") and task.interrupts:
+    #                         for item in task.interrupts:
+    #                             print(f"\n🤖 Assistant: {item.value}")
 
-                                # Get user response to interrupt
-                                input_from_interrupt = True
-                                user_input = input("\n👤 You: ").strip()
+    #                             # Get user response to interrupt
+    #                             input_from_interrupt = True
+    #                             user_input = input("\n👤 You: ").strip()
 
-                                # Resume with JUST the response
-                                self.workflow.invoke(
-                                    Command(resume=user_input), config=config
-                                )
-                                continue
+    #                             # Resume with JUST the response
+    #                             self.workflow.invoke(
+    #                                 Command(resume=user_input), config=config
+    #                             )
+    #                             continue
 
-                # No interrupt? Get normal user input
-                if not input_from_interrupt:
-                    user_input = input("\n👤 You: ").strip()
-                    input_from_interrupt = False
+    #             # No interrupt? Get normal user input
+    #             if not input_from_interrupt:
+    #                 user_input = input("\n👤 You: ").strip()
+    #                 input_from_interrupt = False
 
-                if user_input and user_input.lower() in ["exit", "quit", "bye"]:
-                    print("👋 Goodbye!")
-                    break
+    #             if user_input and user_input.lower() in ["exit", "quit", "bye"]:
+    #                 print("👋 Goodbye!")
+    #                 break
 
-                # Send ONLY the new message, not full state
-                self.workflow.invoke(
-                    {"messages": [HumanMessage(content=user_input)]},  # type: ignore
-                    config=config,
-                )
+    #             # Send ONLY the new message, not full state
+    #             self.workflow.invoke(
+    #                 {"messages": [HumanMessage(content=user_input)]},  # type: ignore
+    #                 config=config,
+    #             )
 
-            except KeyboardInterrupt:
-                print("\n👋 Goodbye!")
-                break
+    #         except KeyboardInterrupt:
+    #             print("\n👋 Goodbye!")
+    #             break
 
-            except Exception as e:
-                print(f"❌ Error: {e}")
-                import traceback
+    #         except Exception as e:
+    #             print(f"❌ Error: {e}")
+    #             import traceback
 
-                traceback.print_exc()
-                break
+    #             traceback.print_exc()
+    #             break
 
-        print("👋 Goodbye!")
+    #     print("👋 Goodbye!")
 
     def _visualize_graph(self):
         """Visualize the graph and save as PNG"""
@@ -693,4 +832,4 @@ class AgenticSchedulerModel:
 
 if __name__ == "__main__":
     model = AgenticSchedulerModel()
-    model.chat_with_model()
+    # model.chat_with_model()
