@@ -60,6 +60,15 @@ function App() {
       });
     },
     onInterrupt: (value) => {
+      // Finalize the streaming message that contains the interrupt text
+      setMessages(prev => {
+        const updated = [...prev];
+        const lastMsg = updated[updated.length - 1];
+        if (lastMsg && lastMsg.streaming) {
+          updated[updated.length - 1] = { ...lastMsg, streaming: false };
+        }
+        return updated;
+      });
       setPendingInterrupt(value);
     },
     onStageChange: (stage) => {

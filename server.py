@@ -77,14 +77,15 @@ async def start_chat():
     config = RunnableConfig(configurable={"thread_id": thread_id}, recursion_limit=50)
 
     initial_state: AgentState = {
-        "messages": [SystemMessage(content='ROLE: You are a expert construction scheduler planner. Help others plans there schedule')],
+        "messages": [SystemMessage(content="")],
         "sender": "user",
         "current_stage": WorkflowStage.INTENT.value,
         "phases": [],
         "user_intent": None,
         "current_phase_index": None,
         "generated_tasks": {},
-        "interrupt": False
+        "interrupt": False,
+        "cache": {},
     }
 
     # Run initial invoke in a thread to not block the event loop
@@ -105,7 +106,6 @@ async def start_chat():
         if isinstance(msg, AIMessage) and msg.content:
             ai_message = msg.content
             break
-
 
     return {
         "thread_id": thread_id,
@@ -128,16 +128,36 @@ async def send_message(request: MessageRequest):
 
         try:
             # Send user message
-            await loop.run_in_executor(
+            result = await loop.run_in_executor(
                 None,
                 lambda: model.workflow.invoke(
                     {"messages": [HumanMessage(content=request.message)]},  # type: ignore
-                    config=config, # type: ignore
+                    config=config,  # type: ignore
                 ),
             )
 
-            # Get updated state
-            state_snapshot = model.workflow.get_state(config)# type: ignore
+            # ✅ CHECK FOR INTERRUPTS FIRST (from invoke result)
+            state_snapshot = model.workflow.get_state(config)  # type: ignore
+            interrupt_value = None
+            if state_snapshot.tasks:
+                for task in state_snapshot.tasks:
+                    if hasattr(task, "interrupts") and task.interrupts:
+                        for item in task.interrupts:
+                            interrupt_value = item.value
+
+            if interrupt_value:
+                # Stream the interrupt message as chat message chunks
+                chunk_size = 3
+                for i in range(0, len(str(interrupt_value)), chunk_size):
+                    chunk = str(interrupt_value)[i : i + chunk_size]
+                    yield sse_event("message", {"chunk": chunk})
+                    await asyncio.sleep(0.02)
+
+                yield sse_event("interrupt", {"value": interrupt_value})
+                yield sse_event("done", {"status": "interrupted"})
+                return
+
+            # Get state values (reuse state_snapshot from interrupt check above)
             state_values = state_snapshot.values
 
             # Extract the last AI message
@@ -168,17 +188,6 @@ async def send_message(request: MessageRequest):
             phases = state_values.get("phases", [])
             if phases:
                 yield sse_event("phases", {"phases": phases})
-
-            # Check for interrupts
-            interrupt_value = None
-            if state_snapshot.tasks:
-                for task in state_snapshot.tasks:
-                    if hasattr(task, "interrupts") and task.interrupts:
-                        for item in task.interrupts:
-                            interrupt_value = item.value
-
-            if interrupt_value:
-                yield sse_event("interrupt", {"value": interrupt_value})
 
             yield sse_event("done", {"status": "complete"})
 
@@ -211,12 +220,12 @@ async def resume_from_interrupt(request: ResumeRequest):
                 None,
                 lambda: model.workflow.invoke(
                     Command(resume=request.response),
-                    config=config,# type: ignore
-                ), 
+                    config=config,  # type: ignore
+                ),
             )
 
             # Get updated state
-            state_snapshot = model.workflow.get_state(config) # type: ignore
+            state_snapshot = model.workflow.get_state(config)  # type: ignore
             state_values = state_snapshot.values
 
             # Extract AI messages added after resume
@@ -258,6 +267,13 @@ async def resume_from_interrupt(request: ResumeRequest):
                             interrupt_value = item.value
 
             if interrupt_value:
+                # Stream the interrupt message as chat message chunks
+                chunk_size = 3
+                for i in range(0, len(str(interrupt_value)), chunk_size):
+                    chunk = str(interrupt_value)[i : i + chunk_size]
+                    yield sse_event("message", {"chunk": chunk})
+                    await asyncio.sleep(0.02)
+
                 yield sse_event("interrupt", {"value": interrupt_value})
 
             yield sse_event("done", {"status": "complete"})
@@ -283,7 +299,7 @@ async def get_state(thread_id: str):
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 50}
 
     try:
-        state_snapshot = model.workflow.get_state(config) # type: ignore
+        state_snapshot = model.workflow.get_state(config)  # type: ignore
         state_values = state_snapshot.values
 
         if not state_values:

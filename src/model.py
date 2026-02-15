@@ -40,10 +40,11 @@ class AgentState(TypedDict):
     sender: Annotated[str, "The sender of last message"]
     current_stage: str
     phases: list
-    user_intent: Optional[str]
+    user_intent: Optional[str | dict]
     current_phase_index: Optional[int]
     generated_tasks: Optional[dict]  # Store tasks by phase name
     interrupt: bool
+    cache: Optional[dict]
 
 
 class ConstructionIntent(BaseModel):
@@ -228,6 +229,8 @@ class AgenticSchedulerModel:
         3. Listen to what the user provides and adapt your questions
         4. Only call the submit_construction_intent tool when you have enough information
         5. If the user gives vague answers, ask for clarification before submitting
+        6. Store other details in other_details. the key should be phases_agent,details_agent or scheduling_agent. depedending on who requires that data
+        7. Do not try to explain the details or ask for more if it is not required for intent phase
 
         **When you have sufficient information**, call the submit_construction_intent tool with all the details.
 
@@ -282,52 +285,82 @@ class AgenticSchedulerModel:
 
             print("\n===== INTENT NODE =====\n")
 
-            # Normal flow - invoke the agent
-            result = intent_agent.invoke(state)  # type: ignore
-            messages = result["messages"]
-            last_message = messages[-1]
+            # To check if the graph is interuppted
+            interrupted = state["interrupt"]
 
-            if (
-                last_message
-                and hasattr(last_message, "content")
-                and last_message.content
-            ):
-                print(f"\n🤖 Assistant: {last_message.content}")
+            if not interrupted:
+                # Normal flow - invoke the agent
+                result = intent_agent.invoke(state)  # type: ignore
+                messages = result["messages"]
+                last_message = messages[-1]
 
-            intent_phase_tool_calls = extract_toolcall(
-                messages, "submit_construction_intent"
-            )
+                intent_phase_tool_calls = extract_toolcall(
+                    messages, "submit_construction_intent"
+                )
 
-            if intent_phase_tool_calls:
-                tool_data = intent_phase_tool_calls[-1]  # Get the last tool call
-                tool_call = tool_data["tool_call"]
-                tool_messages = tool_data["messages"]
-                user_response_lower = None
-                structured_intent = None
+                if (
+                    last_message
+                    and hasattr(last_message, "content")
+                    and last_message.content
+                    and (not intent_phase_tool_calls)
+                ):
+                    print(f"\n🤖 Assistant: {last_message.content}")
 
-                if tool_call["name"] == "submit_construction_intent":
+                if intent_phase_tool_calls:
+                    tool_data = intent_phase_tool_calls[-1]  # Get the last tool call
+                    tool_call = tool_data["tool_call"]
+                    tool_messages = tool_data["messages"]
+                    user_response_lower = None
+                    structured_intent = None
 
-                    args = tool_call["args"]
+                    if tool_call["name"] == "submit_construction_intent":
 
-                    structured_intent = ConstructionIntent(
-                        project_type=args["project_type"],
-                        building_category=args["building_category"],
-                        size={"value": args["size_value"], "unit": args["size_unit"]},
-                        floors=args.get("floors"),
-                        location=args.get("location"),
-                        special_requirements=args.get("special_requirements", []),
-                        timeline_preference=args.get("timeline_preference"),
-                        budget_range=(
-                            {
-                                "min": args.get("budget_min"),
-                                "max": args.get("budget_max"),
-                                "currency": args.get("budget_currency", "USD"),
-                            }
-                            if args.get("budget_min") or args.get("budget_max")
-                            else None
-                        ),
-                    )
+                        args = tool_call["args"]
 
+                        structured_intent = ConstructionIntent(
+                            project_type=args["project_type"],
+                            building_category=args["building_category"],
+                            size={
+                                "value": args["size_value"],
+                                "unit": args["size_unit"],
+                            },
+                            floors=args.get("floors"),
+                            location=args.get("location"),
+                            special_requirements=args.get("special_requirements", []),
+                            timeline_preference=args.get("timeline_preference"),
+                            budget_range=(
+                                {
+                                    "min": args.get("budget_min"),
+                                    "max": args.get("budget_max"),
+                                    "currency": args.get("budget_currency", "USD"),
+                                }
+                                if args.get("budget_min") or args.get("budget_max")
+                                else None
+                            ),
+                        )
+
+                        return Command(
+                            update=AgentState(
+                                {
+                                    **state,
+                                    "messages": [],
+                                    "cache": {
+                                        "intent_data": structured_intent,
+                                    },
+                                    "interrupt": True,
+                                }
+                            ),
+                            goto="intent_agent",
+                        )
+
+                else:
+                    return AgentState({**state, "messages": [last_message]})
+
+            else:
+                state_cache = state["cache"]
+
+                if state_cache:
+                    structured_intent: ConstructionIntent = state_cache.get("intent_data")  # type: ignore
                     intent_summary = structured_intent.to_summary()
 
                     user_response = interrupt(
@@ -337,84 +370,94 @@ class AgenticSchedulerModel:
                         "• Type corrections if something needs to be changed\n"
                         "• Type 'cancel' to start over"
                     )
+
                     user_response_lower = (
                         user_response.lower().strip() if user_response else ""
                     )
 
-                if user_response_lower in [
-                    "yes",
-                    "confirm",
-                ]:
-                    print(f"✓ Intent confirmed by user")
+                    if user_response_lower in ["yes", "confirm"]:
+                        print(f"✓ Intent confirmed by user")
 
                     user_intent = None
                     if structured_intent:
                         user_intent = structured_intent.model_dump()
 
                     return Command(
-                        update={
-                            "messages": [],
-                            "sender": "intent_agent",
-                            "current_stage": WorkflowStage.PHASES.value,
-                            "user_intent": user_intent,
-                            "phases": [],
-                            "current_phase_index": None,
-                        },
+                        update=AgentState(
+                            {
+                                **state,
+                                "messages": [],
+                                "sender": "intent_agent",
+                                "current_stage": WorkflowStage.PHASES.value,
+                                "user_intent": user_intent,
+                                "cache": {},
+                                "interrupt": False,
+                            }
+                        ),
                         goto="phase_agent",  # Explicitly route to phase agent
                     )
-
-                elif user_response_lower in ["cancel", "start over", "reset"]:
-                    print("User cancelled - restarting intent gathering")
-
-                    # Add a system message explaining the restart
-                    restart_msg = SystemMessage(
-                        content="No problem! Let's start fresh. What type of construction project would you like to plan?"
-                    )
-
-                    # Reset the DATA but keep conversation history
-                    return AgentState({
-                        "messages": [restart_msg],
-                        "sender": "user",  # Reset sender to trigger fresh agent call
-                        "current_stage": WorkflowStage.INTENT.value,
-                        "user_intent": None,  # Clear structured data
-                        "phases": [],
-                        "current_phase_index": None,
-                        "generated_tasks": {},
-                        "interrupt": False
-                    } )
-
                 else:
-                    # User wants corrections
-                    print(f"User requested corrections: {user_response_lower}")
-                    from langchain_core.messages import ToolMessage
-
-                    # Send tool result and user correction
-                    tool_msg = ToolMessage(
-                        content="User requested changes before confirmation",
-                        tool_call_id=tool_call["id"],
-                    )
-                    correction_msg = HumanMessage(
-                        content=f"Please update the project details based on this feedback: {user_response_lower}" 
+                    return AgentState(
+                        {**state, "messages": [], "interrupt": False, "cache": {}}
                     )
 
-                    return {
-                        "messages": [tool_messages, tool_msg, correction_msg],
-                        "sender": "user",  # Reset sender so agent re-invokes
-                        "current_stage": WorkflowStage.INTENT.value,
-                        "phases": state.get("phases", None),
-                        "user_intent": None,
-                        "current_phase_index": None,
-                    } # type: ignore
+            return AgentState(
+                {**state, "messages": [], "interrupt": False, "cache": {}}
+            )
 
-            else:
-                return {
-                    "messages": [last_message],
-                    "sender": "intent_agent",
-                    "current_stage": WorkflowStage.INTENT.value,
-                    "phases": state.get("phases", None),
-                    "user_intent": None,
-                    "current_phase_index": None,
-                }  # type: ignore
+            #     elif user_response_lower in ["cancel", "start over", "reset"]:
+            #         print("User cancelled - restarting intent gathering")
+
+            #         # Add a system message explaining the restart
+            #         restart_msg = SystemMessage(
+            #             content="No problem! Let's start fresh. What type of construction project would you like to plan?"
+            #         )
+
+            #         # Reset the DATA but keep conversation history
+            #         return AgentState({
+            #             "messages": [restart_msg],
+            #             "sender": "user",  # Reset sender to trigger fresh agent call
+            #             "current_stage": WorkflowStage.INTENT.value,
+            #             "user_intent": None,  # Clear structured data
+            #             "phases": [],
+            #             "current_phase_index": None,
+            #             "generated_tasks": {},
+            #             "interrupt": False,
+            #             "cache": {}
+            #         } )
+
+            #     else:
+            #         # User wants corrections
+            #         print(f"User requested corrections: {user_response_lower}")
+            #         from langchain_core.messages import ToolMessage
+
+            #         # Send tool result and user correction
+            #         tool_msg = ToolMessage(
+            #             content="User requested changes before confirmation",
+            #             tool_call_id=tool_call["id"],
+            #         )
+            #         correction_msg = HumanMessage(
+            #             content=f"Please update the project details based on this feedback: {user_response_lower}"
+            #         )
+
+            #         return {
+            #             "messages": [tool_messages, tool_msg, correction_msg],
+            #             "sender": "user",  # Reset sender so agent re-invokes
+            #             "current_stage": WorkflowStage.INTENT.value,
+            #             "phases": state.get("phases", None),
+            #             "user_intent": None,
+            #             "current_phase_index": None,
+            #         } # type: ignore
+
+            # else:
+            #     return {
+            #         "messages": [last_message],
+            #         "sender": "intent_agent",
+            #         "current_stage": WorkflowStage.INTENT.value,
+            #         "phases": state.get("phases", None),
+            #         "user_intent": None,
+            #         "current_phase_index": None,
+            #     }  # type: ignore
 
         # Create Phase Agent
         PHASE_AGENT_SYSTEM_PROMPT = """
@@ -499,7 +542,7 @@ class AgenticSchedulerModel:
                             "phases": [],
                             "user_intent": state.get("user_intent", ""),
                             "current_phase_index": None,
-                        } # type: ignore
+                        }  # type: ignore
 
                 # No tool call yet - agent is still asking questions, wait for user input
                 return {
@@ -509,7 +552,7 @@ class AgenticSchedulerModel:
                     "phases": [],
                     "user_intent": state.get("user_intent", ""),
                     "current_phase_index": None,
-                } # type: ignore
+                }  # type: ignore
 
             result = phase_agent.invoke(state)  # type: ignore
             messages = result["messages"]
@@ -561,7 +604,7 @@ class AgenticSchedulerModel:
                 "phases": state.get("phases", None),
                 "user_intent": state.get("user_intent", ""),
                 "current_phase_index": None,
-            } # type: ignore
+            }  # type: ignore
 
         # Create Details Agent
         DETAIL_AGENT_SYSTEM_PROMPT = """
@@ -644,7 +687,7 @@ class AgenticSchedulerModel:
 
             try:
                 result = self.llm.with_structured_output(TaskList).invoke(prompt)
-                phase_tasks = [task.model_dump() for task in result.tasks] # type: ignore
+                phase_tasks = [task.model_dump() for task in result.tasks]  # type: ignore
                 print(f"Generated {len(phase_tasks)} tasks for {current_phase}")
 
                 # Store tasks for this phase
@@ -674,7 +717,7 @@ class AgenticSchedulerModel:
                 "user_intent": user_intent,
                 "current_phase_index": current_phase_idx + 1,
                 "generated_tasks": generated_tasks,
-            } # type: ignore
+            }  # type: ignore
 
         def scheduling_node(state: AgentState) -> AgentState:
             final_approval = interrupt("Requesting final schedule approval.")
@@ -714,8 +757,6 @@ class AgenticSchedulerModel:
                 if state["current_stage"] == WorkflowStage.DETAILS.value
                 else END
             )
-
-            
 
         def details_exit_router(state: AgentState):
             return (
