@@ -226,6 +226,27 @@ async def resume_from_interrupt(request: ResumeRequest):
 
             # Get updated state
             state_snapshot = model.workflow.get_state(config)  # type: ignore
+
+            # Check for new interrupts
+            interrupt_value = None
+            if state_snapshot.tasks:
+                for task in state_snapshot.tasks:
+                    if hasattr(task, "interrupts") and task.interrupts:
+                        for item in task.interrupts:
+                            interrupt_value = item.value
+
+            if interrupt_value:
+                # Stream the interrupt message as chat message chunks
+                chunk_size = 3
+                for i in range(0, len(str(interrupt_value)), chunk_size):
+                    chunk = str(interrupt_value)[i : i + chunk_size]
+                    yield sse_event("message", {"chunk": chunk})
+                    await asyncio.sleep(0.02)
+
+                yield sse_event("interrupt", {"value": interrupt_value})
+                yield sse_event("done", {"status": "complete"})
+                return
+
             state_values = state_snapshot.values
 
             # Extract AI messages added after resume
@@ -257,24 +278,6 @@ async def resume_from_interrupt(request: ResumeRequest):
             phases = state_values.get("phases", [])
             if phases:
                 yield sse_event("phases", {"phases": phases})
-
-            # Check for new interrupts
-            interrupt_value = None
-            if state_snapshot.tasks:
-                for task in state_snapshot.tasks:
-                    if hasattr(task, "interrupts") and task.interrupts:
-                        for item in task.interrupts:
-                            interrupt_value = item.value
-
-            if interrupt_value:
-                # Stream the interrupt message as chat message chunks
-                chunk_size = 3
-                for i in range(0, len(str(interrupt_value)), chunk_size):
-                    chunk = str(interrupt_value)[i : i + chunk_size]
-                    yield sse_event("message", {"chunk": chunk})
-                    await asyncio.sleep(0.02)
-
-                yield sse_event("interrupt", {"value": interrupt_value})
 
             yield sse_event("done", {"status": "complete"})
 

@@ -73,6 +73,10 @@ class ConstructionIntent(BaseModel):
     budget_range: dict | None = Field(
         None, description="Budget information if provided"
     )
+    other_details: dict[str, str] | None = Field(
+        None,
+        description="Additional instructions keyed by target agent (phase_agent, details_agent, scheduling_agent)",
+    )
 
     def to_summary(self) -> str:
         """Convert to human-readable summary"""
@@ -90,6 +94,9 @@ class ConstructionIntent(BaseModel):
             summary += f"\nTimeline: {self.timeline_preference}"
         if self.budget_range:
             summary += f"\nBudget: {self.budget_range}"
+        if self.other_details:
+            for key, val in self.other_details.items():
+                summary += f"\nNote for {key}: {val}"
         return summary
 
 
@@ -229,7 +236,7 @@ class AgenticSchedulerModel:
         3. Listen to what the user provides and adapt your questions
         4. Only call the submit_construction_intent tool when you have enough information
         5. If the user gives vague answers, ask for clarification before submitting
-        6. Store other details in other_details. the key should be phases_agent,details_agent or scheduling_agent. depedending on who requires that data
+        6. Store other details in other_details. the key should be phase_agent,details_agent or scheduling_agent. depedending on who requires that data
         7. Do not try to explain the details or ask for more if it is not required for intent phase
 
         **When you have sufficient information**, call the submit_construction_intent tool with all the details.
@@ -311,7 +318,7 @@ class AgenticSchedulerModel:
                     tool_call = tool_data["tool_call"]
                     tool_messages = tool_data["messages"]
                     user_response_lower = None
-                    structured_intent = None
+                    structured_intent = None # type: ignore
 
                     if tool_call["name"] == "submit_construction_intent":
 
@@ -337,6 +344,7 @@ class AgenticSchedulerModel:
                                 if args.get("budget_min") or args.get("budget_max")
                                 else None
                             ),
+                            other_details=args.get("other_details"),
                         )
 
                         return Command(
@@ -376,26 +384,75 @@ class AgenticSchedulerModel:
                     )
 
                     if user_response_lower in ["yes", "confirm"]:
+                        # ✅ User confirmed — proceed to phase agent
                         print(f"✓ Intent confirmed by user")
 
-                    user_intent = None
-                    if structured_intent:
-                        user_intent = structured_intent.model_dump()
+                        user_intent = None
+                        if structured_intent:
+                            user_intent = structured_intent.model_dump()
 
-                    return Command(
-                        update=AgentState(
-                            {
-                                **state,
-                                "messages": [],
-                                "sender": "intent_agent",
-                                "current_stage": WorkflowStage.PHASES.value,
-                                "user_intent": user_intent,
-                                "cache": {},
-                                "interrupt": False,
-                            }
-                        ),
-                        goto="phase_agent",  # Explicitly route to phase agent
-                    )
+                        return Command(
+                            update=AgentState(
+                                {
+                                    **state,
+                                    "messages": [],
+                                    "sender": "intent_agent",
+                                    "current_stage": WorkflowStage.PHASES.value,
+                                    "user_intent": user_intent,
+                                    "cache": {},
+                                    "interrupt": False,
+                                }
+                            ),
+                            goto="phase_agent",
+                        )
+
+                    elif user_response_lower in ["cancel", "start over", "reset"]:
+                        # ❌ User cancelled — restart intent gathering
+                        print("User cancelled - restarting intent gathering")
+
+                        restart_msg = AIMessage(
+                            content="No problem! Let's start fresh. What type of construction project would you like to plan?"
+                        )
+
+                        return Command(
+                            update=AgentState(
+                                {
+                                    **state,
+                                    "messages": [restart_msg],
+                                    "sender": "user",
+                                    "current_stage": WorkflowStage.INTENT.value,
+                                    "user_intent": None,
+                                    "phases": [],
+                                    "current_phase_index": None,
+                                    "generated_tasks": {},
+                                    "interrupt": False,
+                                    "cache": {},
+                                }
+                            ),
+                            goto=END,
+                        )
+
+                    else:
+                        # ✏️ User wants corrections — feed feedback back to intent agent
+                        print(f"User requested corrections: {user_response_lower}")
+
+                        correction_msg = HumanMessage(
+                            content=f"Please update the project details based on this feedback: {user_response}"
+                        )
+
+                        return Command(
+                            update=AgentState(
+                                {
+                                    **state,
+                                    "messages": [correction_msg],
+                                    "sender": "user",
+                                    "current_stage": WorkflowStage.INTENT.value,
+                                    "interrupt": False,
+                                    "cache": {},
+                                }
+                            ),
+                            goto="intent_agent",
+                        )
                 else:
                     return AgentState(
                         {**state, "messages": [], "interrupt": False, "cache": {}}
@@ -405,60 +462,6 @@ class AgenticSchedulerModel:
                 {**state, "messages": [], "interrupt": False, "cache": {}}
             )
 
-            #     elif user_response_lower in ["cancel", "start over", "reset"]:
-            #         print("User cancelled - restarting intent gathering")
-
-            #         # Add a system message explaining the restart
-            #         restart_msg = SystemMessage(
-            #             content="No problem! Let's start fresh. What type of construction project would you like to plan?"
-            #         )
-
-            #         # Reset the DATA but keep conversation history
-            #         return AgentState({
-            #             "messages": [restart_msg],
-            #             "sender": "user",  # Reset sender to trigger fresh agent call
-            #             "current_stage": WorkflowStage.INTENT.value,
-            #             "user_intent": None,  # Clear structured data
-            #             "phases": [],
-            #             "current_phase_index": None,
-            #             "generated_tasks": {},
-            #             "interrupt": False,
-            #             "cache": {}
-            #         } )
-
-            #     else:
-            #         # User wants corrections
-            #         print(f"User requested corrections: {user_response_lower}")
-            #         from langchain_core.messages import ToolMessage
-
-            #         # Send tool result and user correction
-            #         tool_msg = ToolMessage(
-            #             content="User requested changes before confirmation",
-            #             tool_call_id=tool_call["id"],
-            #         )
-            #         correction_msg = HumanMessage(
-            #             content=f"Please update the project details based on this feedback: {user_response_lower}"
-            #         )
-
-            #         return {
-            #             "messages": [tool_messages, tool_msg, correction_msg],
-            #             "sender": "user",  # Reset sender so agent re-invokes
-            #             "current_stage": WorkflowStage.INTENT.value,
-            #             "phases": state.get("phases", None),
-            #             "user_intent": None,
-            #             "current_phase_index": None,
-            #         } # type: ignore
-
-            # else:
-            #     return {
-            #         "messages": [last_message],
-            #         "sender": "intent_agent",
-            #         "current_stage": WorkflowStage.INTENT.value,
-            #         "phases": state.get("phases", None),
-            #         "user_intent": None,
-            #         "current_phase_index": None,
-            #     }  # type: ignore
-
         # Create Phase Agent
         PHASE_AGENT_SYSTEM_PROMPT = """
             You are a construction scheduling assistant. 
@@ -467,6 +470,13 @@ class AgenticSchedulerModel:
             - Ask the user to confirm if these phases look correct.
             - Don't List any task or subtasks in the phases. Only the major phases
             - Use the 'confirm_phases' tool when the user agrees with the phases.
+            
+            **IMPORTANT:** Pay close attention to any special instructions from the user.
+            For example:
+            - If the user says "plan only the foundation phase", list ONLY that phase.
+            - If the user says "plan up to structural phase", list phases only up to that point.
+            - If there are specific notes addressed to you (phase_agent), follow them.
+            - Adapt the phases list to match exactly what the user requested.
             """
 
         phase_agent = create_agent(
@@ -479,132 +489,171 @@ class AgenticSchedulerModel:
 
             print("\n===== PHASE NODE =====\n")
 
-            sender = state["sender"]
+            interrupted = state["interrupt"]
+            print(
+                f"  interrupt={interrupted}, sender={state['sender']}, stage={state['current_stage']}, cache={state.get('cache', {})}"
+            )
 
-            if sender == "intent_agent":
-                user_intent = state["user_intent"]
-                initial_msg = HumanMessage(
-                    content=f"List the major tasks in construction of {user_intent}"
-                )
-                result = phase_agent.invoke({"messages": initial_msg})  # type: ignore
+            if not interrupted:
+                # Normal flow - invoke the agent
+                sender = state["sender"]
+
+                if sender == "intent_agent":
+                    user_intent = state["user_intent"]
+
+                    # Extract phase_agent-specific instructions from other_details
+                    phase_instructions = ""
+                    if isinstance(user_intent, dict):
+                        other_details = user_intent.get("other_details") or {}
+                        if "phase_agent" in other_details:
+                            phase_instructions = f"\n\n**User's specific instructions:** {other_details['phase_agent']}"
+
+                    initial_msg = HumanMessage(
+                        content=f"List the major phases in construction of {user_intent}{phase_instructions}"
+                    )
+                    result = phase_agent.invoke({"messages": initial_msg})  # type: ignore
+                else:
+                    result = phase_agent.invoke(state)  # type: ignore
+
                 messages = result["messages"]
                 last_message = messages[-1]
 
-                if hasattr(last_message, "content") and last_message.content:
-                    print(f"\n🤖 Assistant: {last_message.content}")
-
-                # Check if the agent already called confirm_phases tool
+                # Check if the agent called confirm_phases tool
                 phases_tool_calls = extract_toolcall(messages, "confirm_phases")
 
                 if phases_tool_calls:
-                    # Agent already wants to confirm phases - use interrupt
                     tool_data = phases_tool_calls[-1]
                     tool_call = tool_data["tool_call"]
                     phases_list = tool_call["args"]["phases_list"]
                     phases = [p.strip() for p in phases_list.split(",")]
 
+                    if hasattr(last_message, "content") and last_message.content:
+                        print(f"\n🤖 Assistant: {last_message.content}")
+
+                    print(f"  ✅ Found confirm_phases tool call. Phases: {phases}")
+                    print(
+                        f"  → Storing in cache and setting interrupt=True, looping back"
+                    )
+
+                    # Store phases in cache, set interrupt, loop back
+                    return Command(
+                        update=AgentState(
+                            {
+                                **state,
+                                "sender": "phase_agent",
+                                "messages": [],
+                                "cache": {
+                                    "phases_data": phases,
+                                },
+                                "interrupt": True,
+                            }
+                        ),
+                        goto="phase_agent",
+                    )
+
+                else:
+                    # No tool call yet - agent is still asking questions
+                    if hasattr(last_message, "content") and last_message.content:
+                        print(f"\n🤖 Assistant: {last_message.content}")
+
+                    return AgentState(
+                        {**state, "sender": "phase_agent", "messages": [last_message]}
+                    )
+
+            else:
+                # Interrupted — show phases and ask for confirmation
+                state_cache = state["cache"]
+
+                if state_cache and "phases_data" in state_cache:
+                    phases = state_cache["phases_data"]
+
                     user_response = interrupt(
                         f"📋 Proposed Phases:\n{chr(10).join([f'  • {p}' for p in phases])}\n\n"
-                        "Do you approve these phases? (yes/no or provide changes)"
+                        "Please confirm:\n"
+                        "• Type 'yes' or 'confirm' to proceed\n"
+                        "• Type corrections if something needs to be changed\n"
+                        "• Type 'cancel' to start over"
                     )
+                    print(f"  → Interrupt resumed with response: '{user_response}'")
 
                     user_response_lower = (
                         user_response.lower().strip() if user_response else ""
                     )
 
                     if user_response_lower in ["yes", "confirm"]:
+                        # ✅ User confirmed — proceed to details agent
                         print(f"✓ Phases confirmed by user")
-                        return Command(
-                            update={
-                                "messages": [last_message],
-                                "sender": "phase_agent",
-                                "current_stage": WorkflowStage.DETAILS.value,
-                                "phases": phases,
-                                "user_intent": state.get("user_intent", ""),
-                                "current_phase_index": 0,
-                            }
-                        )
-                    else:
-                        # User wants changes - continue conversation
-                        from langchain_core.messages import ToolMessage
 
-                        tool_msg = ToolMessage(
-                            content="User requested changes to phases",
-                            tool_call_id=tool_call["id"],
+                        return Command(
+                            update=AgentState(
+                                {
+                                    **state,
+                                    "messages": [],
+                                    "sender": "phase_agent",
+                                    "current_stage": WorkflowStage.DETAILS.value,
+                                    "phases": phases,
+                                    "user_intent": state.get("user_intent", ""),
+                                    "current_phase_index": 0,
+                                    "cache": {},
+                                    "interrupt": False,
+                                }
+                            ),
+                            goto="details_agent",
                         )
+
+                    elif user_response_lower in ["cancel", "start over", "reset"]:
+                        # ❌ User cancelled — restart phase gathering
+                        print("User cancelled - restarting phase gathering")
+
+                        restart_msg = AIMessage(
+                            content="No problem! Let's redo the phases. What changes would you like to make to the project phases?"
+                        )
+
+                        return Command(
+                            update=AgentState(
+                                {
+                                    **state,
+                                    "messages": [restart_msg],
+                                    "sender": "user",
+                                    "current_stage": WorkflowStage.PHASES.value,
+                                    "phases": [],
+                                    "current_phase_index": None,
+                                    "interrupt": False,
+                                    "cache": {},
+                                }
+                            ),
+                            goto=END,
+                        )
+
+                    else:
+                        # ✏️ User wants corrections — feed feedback back to phase agent
+                        print(f"User requested corrections: {user_response_lower}")
+
                         correction_msg = HumanMessage(
                             content=f"Please update the phases based on this feedback: {user_response}"
                         )
-                        return {
-                            "messages": messages + [tool_msg, correction_msg],
-                            "sender": "phase_agent",
-                            "current_stage": WorkflowStage.PHASES.value,
-                            "phases": [],
-                            "user_intent": state.get("user_intent", ""),
-                            "current_phase_index": None,
-                        }  # type: ignore
-
-                # No tool call yet - agent is still asking questions, wait for user input
-                return {
-                    "messages": [last_message],
-                    "sender": "phase_agent",
-                    "current_stage": WorkflowStage.PHASES.value,
-                    "phases": [],
-                    "user_intent": state.get("user_intent", ""),
-                    "current_phase_index": None,
-                }  # type: ignore
-
-            result = phase_agent.invoke(state)  # type: ignore
-            messages = result["messages"]
-            last_message = messages[-1]
-
-            if hasattr(last_message, "content") and last_message.content:
-                print(f"\n🤖 Assistant: {last_message.content}")
-
-            phases_tool_calls = extract_toolcall(messages, "confirm_phases")
-
-            if phases_tool_calls:
-                tool_data = phases_tool_calls[-1]  # Get the last tool call
-                tool_call = tool_data["tool_call"]
-                messages = tool_data["messages"]
-                user_response_lower = None
-                structured_intent = None
-
-                if tool_call["name"] == "confirm_phases":
-
-                    phases_list = tool_call["args"]["phases_list"]
-                    phases = [p.strip() for p in phases_list.split(",")]
-                    # Interrupt for Phase Confirmation
-                    user_response = interrupt(f"Do you approve these phases?")
-
-                    user_response_lower = (
-                        user_response.lower().strip() if user_response else ""
-                    )
-
-                    if user_response_lower in ["yes", "confirm"]:
-                        print(f"✓ Phases confirmed by user")
 
                         return Command(
-                            update={
-                                "messages": [last_message],
-                                "sender": "phase_agent",
-                                "current_stage": WorkflowStage.DETAILS.value,
-                                "phases": phases,
-                                "user_intent": state.get("user_intent", ""),
-                                "current_phase_index": 0,  # Reset to first phase
-                            }
+                            update=AgentState(
+                                {
+                                    **state,
+                                    "messages": [correction_msg],
+                                    "sender": "user",
+                                    "current_stage": WorkflowStage.PHASES.value,
+                                    "interrupt": False,
+                                    "cache": {},
+                                }
+                            ),
+                            goto="phase_agent",
                         )
+                else:
+                    return AgentState(
+                        {**state, "messages": [], "interrupt": False, "cache": {}}
+                    )
 
-            # No tool call, return state as-is
-
-            return {
-                "messages": [last_message],
-                "sender": "phase_agent",
-                "current_stage": WorkflowStage.PHASES.value,
-                "phases": state.get("phases", None),
-                "user_intent": state.get("user_intent", ""),
-                "current_phase_index": None,
-            }  # type: ignore
+            return AgentState(
+                {**state, "messages": [], "interrupt": False, "cache": {}}
+            )
 
         # Create Details Agent
         DETAIL_AGENT_SYSTEM_PROMPT = """
