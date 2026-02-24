@@ -93,6 +93,9 @@ async function consumeSSE(response, callbacks) {
                         case 'phases':
                             callbacks.onPhases?.(data.phases);
                             break;
+                        case 'schedule':
+                            callbacks.onSchedule?.(data.schedule);
+                            break;
                         case 'done':
                             callbacks.onDone?.();
                             break;

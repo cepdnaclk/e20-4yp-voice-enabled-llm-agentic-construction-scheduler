@@ -1,6 +1,7 @@
 from pydantic.fields import Field
 from typing import Optional
 import os
+import json
 import operator
 import uuid
 from pydantic.main import BaseModel
@@ -23,6 +24,7 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_classic.chains.retrieval import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
+from src.scheduler import solve_schedule
 
 # load the env variables from the .env file
 load_dotenv(".env")
@@ -43,6 +45,7 @@ class AgentState(TypedDict):
     user_intent: Optional[str | dict]
     current_phase_index: Optional[int]
     generated_tasks: Optional[dict]  # Store tasks by phase name
+    schedule_result: Optional[list]  # Optimised schedule from OR-Tools
     interrupt: bool
     cache: Optional[dict]
 
@@ -318,7 +321,7 @@ class AgenticSchedulerModel:
                     tool_call = tool_data["tool_call"]
                     tool_messages = tool_data["messages"]
                     user_response_lower = None
-                    structured_intent = None # type: ignore
+                    structured_intent = None  # type: ignore
 
                     if tool_call["name"] == "submit_construction_intent":
 
@@ -592,7 +595,6 @@ class AgenticSchedulerModel:
                                     "sender": "phase_agent",
                                     "current_stage": WorkflowStage.DETAILS.value,
                                     "phases": phases,
-                                    "user_intent": state.get("user_intent", ""),
                                     "current_phase_index": 0,
                                     "cache": {},
                                     "interrupt": False,
@@ -671,107 +673,357 @@ class AgenticSchedulerModel:
         def details_node(state: AgentState) -> AgentState | Command:
             print("\n===== DETAILS NODE =====\n")
 
+            interrupted = state["interrupt"]
             current_phase_idx = state["current_phase_index"]
             phases = state["phases"]
             user_intent = state["user_intent"]
             generated_tasks = state.get("generated_tasks") or {}
 
-            # Check if all phases are complete
-            if current_phase_idx is None or current_phase_idx >= len(phases):
-                print("All phases complete, moving to scheduling")
-                return Command(
-                    update={
-                        "current_stage": WorkflowStage.SCHEDULING.value,
-                        "sender": "details_agent",
-                        "generated_tasks": generated_tasks,
-                    }
+            if not interrupted:
+                # ── Normal flow: generate tasks for the current phase ──
+
+                # Check if all phases are complete
+                if current_phase_idx is None or current_phase_idx >= len(phases):
+                    print("All phases complete, moving to scheduling")
+                    return Command(
+                        update={
+                            "current_stage": WorkflowStage.SCHEDULING.value,
+                            "sender": "details_agent",
+                            "generated_tasks": generated_tasks,
+                        }
+                    )
+
+                current_phase = phases[current_phase_idx]
+                print(
+                    f"Processing phase {current_phase_idx + 1}/{len(phases)}: {current_phase}"
                 )
 
-            current_phase = phases[current_phase_idx]
-            print(
-                f"Processing phase {current_phase_idx + 1}/{len(phases)}: {current_phase}"
+                # Step 1: Query KG for known tasks in this phase
+                kg_query = f"What are the tasks for {current_phase} phase?"
+                try:
+                    kg_result = self.cypher_chain.invoke({"query": kg_query})
+                    kg_tasks = kg_result.get("result", "No template found")
+                    print(f"KG Tasks: {kg_tasks}")
+                except Exception as e:
+                    print(f"KG query failed: {e}")
+                    kg_tasks = "No template available"
+
+                # Step 2: Use RAG for additional context
+                try:
+                    rag_result = self.chain.invoke(
+                        {
+                            "input": f"What are the typical tasks for {current_phase} phase in construction?"
+                        }
+                    )
+                    rag_context = rag_result.get("answer", "")
+                    print(f"RAG Context: {rag_context}")
+                except Exception as e:
+                    print(f"RAG query failed: {e}")
+                    rag_context = ""
+
+                # Step 3: LLM generates detailed tasks USING KG as foundation
+                prompt = f"""
+                Generate detailed tasks for the "{current_phase}" phase of a construction project.
+
+                KNOWN TASKS FROM DATABASE (use these as foundation):
+                {kg_tasks}
+
+                ADDITIONAL CONTEXT:
+                {rag_context}
+
+                PROJECT DETAILS: {user_intent}
+
+                Return a structured list of tasks with:
+                - name: task name
+                - duration_days: estimated duration
+                - dependencies: list of [previous_task, relationship_type, lag_days]
+                - resources: list of [resource_name, amount]
+                """
+
+                try:
+                    result = self.llm.with_structured_output(TaskList).invoke(prompt)
+                    phase_tasks = [task.model_dump() for task in result.tasks]  # type: ignore
+                    print(f"Generated {len(phase_tasks)} tasks for {current_phase}")
+                except Exception as e:
+                    print(f"Task generation failed: {e}")
+                    phase_tasks = []
+
+                # Store in cache and interrupt for user review
+                return Command(
+                    update=AgentState(
+                        {
+                            **state,
+                            "sender": "details_agent",
+                            "messages": [],
+                            "cache": {
+                                "pending_tasks": phase_tasks,
+                                "current_phase": current_phase,
+                            },
+                            "interrupt": True,
+                        }
+                    ),
+                    goto="details_agent",
+                )
+
+            else:
+                # ── Interrupted: present tasks for user review ──
+                state_cache = state["cache"]
+
+                if state_cache and "pending_tasks" in state_cache:
+                    pending_tasks = state_cache["pending_tasks"]
+                    phase_name = state_cache["current_phase"]
+
+                    # Build a readable task list for the user
+                    if pending_tasks:
+                        task_list_str = "\n".join(
+                            [
+                                f"  {i+1}. {t['name']} ({t['duration_days']} days)"
+                                for i, t in enumerate(pending_tasks)
+                            ]
+                        )
+                    else:
+                        task_list_str = "  (no tasks generated)"
+
+                    user_response = interrupt(
+                        f'📋 Generated Tasks for "{phase_name}" '
+                        f"(Phase {current_phase_idx + 1}/{len(phases)}):\n" # type: ignore
+                        f"{task_list_str}\n\n"
+                        "Please review:\n"
+                        "• Type 'yes' or 'confirm' to accept and move to the next phase\n"
+                        "• Type your changes (e.g. 'add a soil testing task', 'remove task 3', 'change duration of task 1 to 5 days')\n"
+                        "• Type 'regenerate' to discard and regenerate from scratch"
+                    )
+                    print(f"  → Interrupt resumed with response: '{user_response}'")
+
+                    user_response_lower = (
+                        user_response.lower().strip() if user_response else ""
+                    )
+
+                    if user_response_lower in ["yes", "confirm"]:
+                        # ✅ User confirmed — save tasks and advance to next phase
+                        print(f"✓ Tasks for {phase_name} confirmed by user")
+
+                        generated_tasks[phase_name] = pending_tasks
+
+                        response_msg = AIMessage(
+                            content=f"✅ Confirmed {len(pending_tasks)} tasks for {phase_name}."
+                        )
+
+                        return Command(
+                            update=AgentState(
+                                {
+                                    **state,
+                                    "messages": [response_msg],
+                                    "sender": "details_agent",
+                                    "current_stage": WorkflowStage.DETAILS.value,
+                                    "current_phase_index": current_phase_idx + 1, # type: ignore
+                                    "generated_tasks": generated_tasks,
+                                    "interrupt": False,
+                                    "cache": {},
+                                }
+                            ),
+                            goto="details_agent",
+                        )
+
+                    elif user_response_lower in ["regenerate", "redo", "retry"]:
+                        # 🔄 User wants to regenerate from scratch
+                        print(f"User requested regeneration for {phase_name}")
+
+                        return Command(
+                            update=AgentState(
+                                {
+                                    **state,
+                                    "messages": [],
+                                    "sender": "details_agent",
+                                    "interrupt": False,
+                                    "cache": {},
+                                }
+                            ),
+                            goto="details_agent",
+                        )
+
+                    else:
+                        # ✏️ User wants edits — re-invoke LLM with feedback
+                        print(f"User requested task edits: {user_response}")
+
+                        edit_prompt = f"""
+                        You previously generated these tasks for the "{phase_name}" phase:
+                        {json.dumps(pending_tasks, indent=2)}
+
+                        The user wants the following changes:
+                        "{user_response}"
+
+                        PROJECT DETAILS: {user_intent}
+
+                        Apply the requested changes and return the COMPLETE updated task list with:
+                        - name: task name
+                        - duration_days: estimated duration
+                        - dependencies: list of [previous_task, relationship_type, lag_days]
+                        - resources: list of [resource_name, amount]
+                        """
+
+                        try:
+                            result = self.llm.with_structured_output(TaskList).invoke(
+                                edit_prompt
+                            )
+                            updated_tasks = [task.model_dump() for task in result.tasks]  # type: ignore
+                            print(
+                                f"Regenerated {len(updated_tasks)} tasks after user edits"
+                            )
+                        except Exception as e:
+                            print(f"Edit regeneration failed: {e}, keeping original")
+                            updated_tasks = pending_tasks
+
+                        # Store updated tasks in cache and interrupt again for review
+                        return Command(
+                            update=AgentState(
+                                {
+                                    **state,
+                                    "messages": [],
+                                    "sender": "details_agent",
+                                    "cache": {
+                                        "pending_tasks": updated_tasks,
+                                        "current_phase": phase_name,
+                                    },
+                                    "interrupt": True,
+                                }
+                            ),
+                            goto="details_agent",
+                        )
+                else:
+                    return AgentState(
+                        {**state, "messages": [], "interrupt": False, "cache": {}}
+                    )
+
+            return AgentState(
+                {**state, "messages": [], "interrupt": False, "cache": {}}
             )
 
-            # Step 1: Query KG for known tasks in this phase
-            kg_query = f"What are the tasks for {current_phase} phase?"
-            try:
-                kg_result = self.cypher_chain.invoke({"query": kg_query})
-                kg_tasks = kg_result.get("result", "No template found")
-                print(f"KG Tasks: {kg_tasks}")
-            except Exception as e:
-                print(f"KG query failed: {e}")
-                kg_tasks = "No template available"
+        def scheduling_node(state: AgentState) -> AgentState | Command:
+            print("\n===== SCHEDULING NODE =====\n")
 
-            # Step 2: Use RAG for additional context
-            try:
-                rag_result = self.chain.invoke(
-                    {
-                        "input": f"What are the typical tasks for {current_phase} phase in construction?"
-                    }
+            interrupted = state["interrupt"]
+            generated_tasks = state.get("generated_tasks") or {}
+
+            if not interrupted:
+                # ── Normal flow: run OR-Tools solver ──
+                print("Running OR-Tools CP-SAT solver...")
+
+                try:
+                    schedule = solve_schedule(generated_tasks)
+                    print(f"Solver produced {len(schedule)} scheduled tasks")
+
+                    if schedule:
+                        makespan = max(t["end_day"] for t in schedule)
+                        start_date = schedule[0]["start_date"]
+                        end_date = max(t["end_date"] for t in schedule)
+                    else:
+                        makespan = 0
+                        start_date = "N/A"
+                        end_date = "N/A"
+
+                except Exception as e:
+                    print(f"Scheduling failed: {e}")
+                    schedule = []
+                    makespan = 0
+                    start_date = "N/A"
+                    end_date = "N/A"
+
+                # Store schedule and interrupt for approval
+                return Command(
+                    update=AgentState(
+                        {
+                            **state,
+                            "sender": "scheduling_agent",
+                            "messages": [],
+                            "schedule_result": schedule,
+                            "cache": {
+                                "makespan": makespan,
+                                "start_date": start_date,
+                                "end_date": end_date,
+                            },
+                            "interrupt": True,
+                        }
+                    ),
+                    goto="scheduling_agent",
                 )
-                rag_context = rag_result.get("answer", "")
-                print(f"RAG Context: {rag_context}")
-            except Exception as e:
-                print(f"RAG query failed: {e}")
-                rag_context = ""
 
-            # Step 3: LLM generates detailed tasks USING KG as foundation
-            prompt = f"""
-            Generate detailed tasks for the "{current_phase}" phase of a construction project.
+            else:
+                # ── Interrupted: present schedule summary for approval ──
+                state_cache = state.get("cache") or {}
+                schedule = state.get("schedule_result") or []
+                makespan = state_cache.get("makespan", 0)
+                sched_start = state_cache.get("start_date", "N/A")
+                sched_end = state_cache.get("end_date", "N/A")
 
-            KNOWN TASKS FROM DATABASE (use these as foundation):
-            {kg_tasks}
-
-            ADDITIONAL CONTEXT:
-            {rag_context}
-
-            PROJECT DETAILS: {user_intent}
-
-            Return a structured list of tasks with:
-            - name: task name
-            - duration_days: estimated duration
-            - dependencies: list of [previous_task, relationship_type, lag_days]
-            - resources: list of [resource_name, amount]
-            """
-
-            try:
-                result = self.llm.with_structured_output(TaskList).invoke(prompt)
-                phase_tasks = [task.model_dump() for task in result.tasks]  # type: ignore
-                print(f"Generated {len(phase_tasks)} tasks for {current_phase}")
-
-                # Store tasks for this phase
-                generated_tasks[current_phase] = phase_tasks
-
-                response_msg = AIMessage(
-                    content=f"✅ Generated {len(phase_tasks)} tasks for {current_phase}:\n"
-                    + "\n".join(
-                        [
-                            f"  - {t['name']} ({t['duration_days']} days)"
-                            for t in phase_tasks
-                        ]
+                # Build summary by phase
+                phase_summaries = {}
+                for t in schedule:
+                    phase = t["phase"]
+                    if phase not in phase_summaries:
+                        phase_summaries[phase] = []
+                    phase_summaries[phase].append(
+                        f"    {t['name']}: {t['start_date']} → {t['end_date']} ({t['duration_days']}d)"
                     )
-                )
-            except Exception as e:
-                print(f"Task generation failed: {e}")
-                response_msg = AIMessage(
-                    content=f"⚠️ Could not generate structured tasks for {current_phase}: {str(e)}"
+
+                summary_lines = []
+                for phase, tasks in phase_summaries.items():
+                    summary_lines.append(f"  📌 {phase}:")
+                    summary_lines.extend(tasks)
+
+                user_response = interrupt(
+                    f"📅 Optimised Schedule ({makespan} days total)\n"
+                    f"   Start: {sched_start}  →  End: {sched_end}\n\n"
+                    + "\n".join(summary_lines)
+                    + "\n\nType 'yes' to finalise or provide feedback to adjust."
                 )
 
-            # Move to next phase
-            return {
-                "messages": [response_msg],
-                "sender": "details_agent",
-                "current_stage": WorkflowStage.DETAILS.value,
-                "phases": phases,
-                "user_intent": user_intent,
-                "current_phase_index": current_phase_idx + 1,
-                "generated_tasks": generated_tasks,
-            }  # type: ignore
+                user_response_lower = (
+                    user_response.lower().strip() if user_response else ""
+                )
 
-        def scheduling_node(state: AgentState) -> AgentState:
-            final_approval = interrupt("Requesting final schedule approval.")
-            print(f"Final Schedule Approval: {final_approval}")
-            return state
+                if user_response_lower in ["yes", "confirm", "approve"]:
+                    print("✓ Schedule approved by user")
+
+                    response_msg = AIMessage(
+                        content=f"✅ Schedule finalised! {len(schedule)} tasks over {makespan} days "
+                        f"({sched_start} → {sched_end}).\n\n"
+                        "The Gantt chart is now available in the side panel."
+                    )
+
+                    return Command(
+                        update=AgentState(
+                            {
+                                **state,
+                                "messages": [response_msg],
+                                "sender": "scheduling_agent",
+                                "interrupt": False,
+                                "cache": {},
+                            }
+                        ),
+                        goto=END,
+                    )
+                else:
+                    # User wants changes — not yet implemented, just re-approve
+                    print(f"User feedback on schedule: {user_response}")
+
+                    feedback_msg = AIMessage(
+                        content=f'Noted your feedback: "{user_response}". '
+                        "Manual schedule adjustments will be supported in a future update. "
+                        "For now, please type 'yes' to approve the current schedule."
+                    )
+
+                    return Command(
+                        update=AgentState(
+                            {
+                                **state,
+                                "messages": [feedback_msg],
+                                "sender": "scheduling_agent",
+                                "interrupt": True,
+                            }
+                        ),
+                        goto="scheduling_agent",
+                    )
 
         # Build the workflow with proper state
         workflow = StateGraph(AgentState)

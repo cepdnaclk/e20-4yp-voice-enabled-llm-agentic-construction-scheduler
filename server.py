@@ -84,6 +84,7 @@ async def start_chat():
         "user_intent": None,
         "current_phase_index": None,
         "generated_tasks": {},
+        "schedule_result": [],
         "interrupt": False,
         "cache": {},
     }
@@ -184,6 +185,11 @@ async def send_message(request: MessageRequest):
             if generated_tasks:
                 yield sse_event("tasks", {"tasks": generated_tasks})
 
+            # Check for schedule result
+            schedule_result = state_values.get("schedule_result", [])
+            if schedule_result:
+                yield sse_event("schedule", {"schedule": schedule_result})
+
             # Check for phases
             phases = state_values.get("phases", [])
             if phases:
@@ -273,6 +279,11 @@ async def resume_from_interrupt(request: ResumeRequest):
             generated_tasks = state_values.get("generated_tasks", {})
             if generated_tasks:
                 yield sse_event("tasks", {"tasks": generated_tasks})
+
+            # Schedule result
+            schedule_result = state_values.get("schedule_result", [])
+            if schedule_result:
+                yield sse_event("schedule", {"schedule": schedule_result})
 
             # Phases
             phases = state_values.get("phases", [])

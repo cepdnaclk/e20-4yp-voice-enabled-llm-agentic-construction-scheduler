@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import './App.css';
 import ChatInterface from './components/ChatInterface';
 import TaskBoard from './components/TaskBoard';
+import GanttChart from './components/GanttChart';
 import StageTracker from './components/StageTracker';
 import { startChat, sendMessage, resumeChat } from './api';
 
@@ -11,6 +12,7 @@ function App() {
   const [currentStage, setCurrentStage] = useState('intent');
   const [phases, setPhases] = useState([]);
   const [generatedTasks, setGeneratedTasks] = useState({});
+  const [scheduleData, setScheduleData] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
   const [pendingInterrupt, setPendingInterrupt] = useState(null);
   const [isInitializing, setIsInitializing] = useState(true);
@@ -80,6 +82,9 @@ function App() {
     onPhases: (phasesData) => {
       setPhases(phasesData);
     },
+    onSchedule: (schedule) => {
+      setScheduleData(schedule);
+    },
     onDone: () => {
       setMessages(prev => {
         const updated = [...prev];
@@ -118,7 +123,9 @@ function App() {
     }
   };
 
-  const showTaskBoard = currentStage === 'details' || currentStage === 'scheduling';
+  const showTaskBoard = currentStage === 'details';
+  const showGantt = currentStage === 'scheduling' && scheduleData.length > 0;
+  const showSidePanel = showTaskBoard || showGantt;
 
   return (
     <div className="app">
@@ -135,7 +142,7 @@ function App() {
       </header>
 
       {/* Main Content */}
-      <main className={`app-main ${showTaskBoard ? 'with-tasks' : ''}`}>
+      <main className={`app-main ${showSidePanel ? 'with-tasks' : ''}`}>
         <div className="chat-panel">
           <ChatInterface
             messages={messages}
@@ -153,6 +160,12 @@ function App() {
               phases={phases}
               generatedTasks={generatedTasks}
             />
+          </div>
+        )}
+
+        {showGantt && (
+          <div className="task-panel">
+            <GanttChart scheduleData={scheduleData} />
           </div>
         )}
       </main>
