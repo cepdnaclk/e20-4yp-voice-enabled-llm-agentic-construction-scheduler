@@ -25,6 +25,7 @@ def setup_tools(model_instance):
 
 #### Intent Tools ####
 
+
 @tool
 def submit_construction_intent(
     project_type: Literal[
@@ -63,9 +64,8 @@ def submit_construction_intent(
 @tool
 def confirm_phases(phases_list: str) -> list:
     """
-    Call this tool when the user agrees to the proposed phases.
+    Call this tool once you have identified the major construction phases for the project.
     Input should be a comma-separated list of phases (e.g., "Foundation, Framing, Roofing").
-    This will also update the phases state in the model.
     """
     # Parse the list
     phases = [p.strip() for p in phases_list.split(",")]
@@ -73,6 +73,7 @@ def confirm_phases(phases_list: str) -> list:
         return []
 
     return phases
+
 
 intent_tools = [submit_construction_intent]
 

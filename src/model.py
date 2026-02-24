@@ -469,10 +469,9 @@ class AgenticSchedulerModel:
         PHASE_AGENT_SYSTEM_PROMPT = """
             You are a construction scheduling assistant. 
             - List the major phases for the project based on the user's intent.
-            - No pre-construction phases are required (except Site Prep).
-            - Ask the user to confirm if these phases look correct.
+            - No pre-construction phases are required (except Site Preparation).
             - Don't List any task or subtasks in the phases. Only the major phases
-            - Use the 'confirm_phases' tool when the user agrees with the phases.
+            - Call the "confirm_phases" tool if neccesary major tasks are known.
             
             **IMPORTANT:** Pay close attention to any special instructions from the user.
             For example:
@@ -493,10 +492,8 @@ class AgenticSchedulerModel:
             print("\n===== PHASE NODE =====\n")
 
             interrupted = state["interrupt"]
-            print(
-                f"  interrupt={interrupted}, sender={state['sender']}, stage={state['current_stage']}, cache={state.get('cache', {})}"
-            )
-
+            
+            
             if not interrupted:
                 # Normal flow - invoke the agent
                 sender = state["sender"]
@@ -532,11 +529,6 @@ class AgenticSchedulerModel:
 
                     if hasattr(last_message, "content") and last_message.content:
                         print(f"\n🤖 Assistant: {last_message.content}")
-
-                    print(f"  ✅ Found confirm_phases tool call. Phases: {phases}")
-                    print(
-                        f"  → Storing in cache and setting interrupt=True, looping back"
-                    )
 
                     # Store phases in cache, set interrupt, loop back
                     return Command(
@@ -652,10 +644,6 @@ class AgenticSchedulerModel:
                     return AgentState(
                         {**state, "messages": [], "interrupt": False, "cache": {}}
                     )
-
-            return AgentState(
-                {**state, "messages": [], "interrupt": False, "cache": {}}
-            )
 
         # Create Details Agent
         DETAIL_AGENT_SYSTEM_PROMPT = """
