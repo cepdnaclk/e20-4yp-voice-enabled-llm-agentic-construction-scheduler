@@ -501,6 +501,13 @@ class AgenticSchedulerModel:
                 if sender == "intent_agent":
                     user_intent = state["user_intent"]
 
+                    # Get the List of Major Phases in the Knowledge Graph
+                    KG_phases = self.graph.query("MATCH (n:Phase) RETURN n.name")
+
+                    task_name_list = [task["n.name"] for task in KG_phases]
+
+                    task_name_instructions = f"\n\n You may use the following task name when neccesary {task_name_list} to maintain consistency in naming"
+                    
                     # Extract phase_agent-specific instructions from other_details
                     phase_instructions = ""
                     if isinstance(user_intent, dict):
@@ -508,10 +515,18 @@ class AgenticSchedulerModel:
                         if "phase_agent" in other_details:
                             phase_instructions = f"\n\n**User's specific instructions:** {other_details['phase_agent']}"
 
+                    # With KG
                     initial_msg = HumanMessage(
-                        content=f"List the major phases in construction of {user_intent}{phase_instructions}"
+                        content=f"List the major phases in construction of {user_intent}{phase_instructions}{task_name_instructions}"
                     )
+
+                    # Without KG
+                    # initial_msg = HumanMessage(
+                    #     content=f"List the major phases in construction of {user_intent}{phase_instructions}"
+                    # )
+
                     result = phase_agent.invoke({"messages": initial_msg})  # type: ignore
+
                 else:
                     result = phase_agent.invoke(state)  # type: ignore
 
@@ -883,10 +898,6 @@ class AgenticSchedulerModel:
                         {**state, "messages": [], "interrupt": False, "cache": {}}
                     )
 
-            return AgentState(
-                {**state, "messages": [], "interrupt": False, "cache": {}}
-            )
-
         def scheduling_node(state: AgentState) -> AgentState | Command:
             print("\n===== SCHEDULING NODE =====\n")
 
@@ -1070,83 +1081,6 @@ class AgenticSchedulerModel:
                         if isinstance(item, dict) and "value" in item:
                             return item["value"]
         return None
-
-    # def chat_with_model(self):
-    #     print("🚀 AI Assistant Started!")
-    #     print("-" * 60)
-
-    #     # Create a thread ID
-    #     thread_id = str(uuid.uuid4())
-    #     config = RunnableConfig(
-    #         configurable={"thread_id": thread_id}, recursion_limit=50
-    #     )
-
-    #     print(f"Thread ID: {thread_id}")
-
-    #     # START with initial state ONLY ONCE
-    #     initial_state: AgentState = {
-    #         "messages": [HumanMessage(content="", config=config)],
-    #         "sender": "user",
-    #         "current_stage": WorkflowStage.INTENT.value,  # Start from INTENT
-    #         "phases": [],
-    #         "user_intent": None,
-    #         "current_phase_index": None,
-    #         "generated_tasks": {},
-    #     }
-
-    #     # Initial invoke with empty state
-    #     self.workflow.invoke(initial_state, config=config)
-
-    #     while True:
-    #         input_from_interrupt = False
-    #         user_input = None
-    #         try:
-    #             # Check for interrupts FIRST
-    #             state_snapshot = self.workflow.get_state(config)
-
-    #             if state_snapshot.tasks:
-    #                 for task in state_snapshot.tasks:
-    #                     if hasattr(task, "interrupts") and task.interrupts:
-    #                         for item in task.interrupts:
-    #                             print(f"\n🤖 Assistant: {item.value}")
-
-    #                             # Get user response to interrupt
-    #                             input_from_interrupt = True
-    #                             user_input = input("\n👤 You: ").strip()
-
-    #                             # Resume with JUST the response
-    #                             self.workflow.invoke(
-    #                                 Command(resume=user_input), config=config
-    #                             )
-    #                             continue
-
-    #             # No interrupt? Get normal user input
-    #             if not input_from_interrupt:
-    #                 user_input = input("\n👤 You: ").strip()
-    #                 input_from_interrupt = False
-
-    #             if user_input and user_input.lower() in ["exit", "quit", "bye"]:
-    #                 print("👋 Goodbye!")
-    #                 break
-
-    #             # Send ONLY the new message, not full state
-    #             self.workflow.invoke(
-    #                 {"messages": [HumanMessage(content=user_input)]},  # type: ignore
-    #                 config=config,
-    #             )
-
-    #         except KeyboardInterrupt:
-    #             print("\n👋 Goodbye!")
-    #             break
-
-    #         except Exception as e:
-    #             print(f"❌ Error: {e}")
-    #             import traceback
-
-    #             traceback.print_exc()
-    #             break
-
-    #     print("👋 Goodbye!")
 
     def _visualize_graph(self):
         """Visualize the graph and save as PNG"""
