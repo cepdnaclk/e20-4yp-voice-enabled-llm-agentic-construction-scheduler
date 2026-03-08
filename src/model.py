@@ -1,5 +1,5 @@
 from pydantic.fields import Field
-from typing import Optional
+from typing import Any, Dict, Optional
 import os
 import json
 import operator
@@ -42,6 +42,9 @@ class AgentState(TypedDict):
     sender: Annotated[str, "The sender of last message"]
     current_stage: str
     phases: list
+    project_wbs: Optional[
+        dict
+    ]  # Full WBS from phase_node (FullProjectWBS.model_dump())
     user_intent: Optional[str | dict]
     current_phase_index: Optional[int]
     generated_tasks: Optional[dict]  # Store tasks by phase name
@@ -162,6 +165,50 @@ class TaskList(BaseModel):
     tasks: List[Task] = Field(..., description="List of tasks")
 
 
+class WBS_Phases(BaseModel):
+    """Collection of WBS Major phase for the current project"""
+
+    phases: List[str] = Field(..., description="List of WBS phases for current project")
+
+
+class WBSTask(BaseModel):
+    """A single task within a work package"""
+
+    name: str = Field(..., description="Task name")
+    description: str | None = Field(None, description="Brief task description")
+
+
+class WBSPackage(BaseModel):
+    """A work package containing tasks"""
+
+    name: str = Field(..., description="Work package name")
+    tasks: list[WBSTask] = Field(
+        default_factory=list, description="Tasks in this package"
+    )
+
+
+class WBSPhase(BaseModel):
+    """A project phase containing work packages"""
+
+    name: str = Field(..., description="Phase name")
+    packages: list[WBSPackage] = Field(
+        default_factory=list, description="Work packages in this phase"
+    )
+
+
+class FullProjectWBS(BaseModel):
+    """Complete Work Breakdown Structure adapted for the user's project"""
+
+    project_name: str = Field(..., description="Name of the reference project template")
+    phases: list[WBSPhase] = Field(
+        ..., description="Adapted phases with packages and tasks"
+    )
+
+
+class SelectedProject(BaseModel):
+    project: str
+
+
 class AgenticSchedulerModel:
 
     def __init__(self):
@@ -179,16 +226,16 @@ class AgenticSchedulerModel:
             database=os.getenv("NEO4J_DATABASE") or "",
         )
 
-        self.vector_index = Neo4jVector.from_existing_graph(
-            OpenAIEmbeddings(),
-            url=os.getenv("NEO4J_URI") or "",
-            username=os.getenv("NEO4J_USERNAME") or "",
-            password=os.getenv("NEO4J_PASSWORD") or "",
-            index_name="task",
-            node_label="Subtask",
-            text_node_properties=["name", "description"],
-            embedding_node_property="embedding",
-        )
+        # self.vector_index = Neo4jVector.from_existing_graph(
+        #     OpenAIEmbeddings(),
+        #     url=os.getenv("NEO4J_URI") or "",
+        #     username=os.getenv("NEO4J_USERNAME") or "",
+        #     password=os.getenv("NEO4J_PASSWORD") or "",
+        #     index_name="task",
+        #     node_label="Subtask",
+        #     text_node_properties=["name", "description"],
+        #     embedding_node_property="embedding",
+        # )
 
         # TODO find better alternative to allow_dangerous_requests=True
         self.cypher_chain = GraphCypherQAChain.from_llm(
@@ -196,7 +243,7 @@ class AgenticSchedulerModel:
         )
 
         # TODO vectorizing the graph
-        retriever = self.vector_index.as_retriever()
+        # retriever = self.vector_index.as_retriever()
 
         llm = ChatOpenAI(temperature=0)
 
@@ -213,7 +260,7 @@ class AgenticSchedulerModel:
 
         document_chain = create_stuff_documents_chain(llm, prompt)
 
-        self.chain = create_retrieval_chain(retriever, document_chain)
+        # self.chain = create_retrieval_chain(retriever, document_chain)
 
         self.workflow = self._build_workflow()
         self._visualize_graph()
@@ -465,120 +512,230 @@ class AgenticSchedulerModel:
                 {**state, "messages": [], "interrupt": False, "cache": {}}
             )
 
-        # Create Phase Agent
-        PHASE_AGENT_SYSTEM_PROMPT = """
-            You are a construction scheduling assistant. 
-            - List the major phases for the project based on the user's intent.
-            - No pre-construction phases are required (except Site Preparation).
-            - Don't List any task or subtasks in the phases. Only the major phases
-            - Call the "confirm_phases" tool if neccesary major tasks are known.
-            
-            **IMPORTANT:** Pay close attention to any special instructions from the user.
-            For example:
-            - If the user says "plan only the foundation phase", list ONLY that phase.
-            - If the user says "plan up to structural phase", list phases only up to that point.
-            - If there are specific notes addressed to you (phase_agent), follow them.
-            - Adapt the phases list to match exactly what the user requested.
+        def _fetch_full_template_tree(project_name: str) -> dict:
             """
+            One recursive Cypher query to fetch the full project template tree
+            (project → phases → packages → tasks) and build a nested dict.
+            """
+            query = """
+            MATCH path = (p:WorkTemplate {name: $project_name})-[:HAS_CHILD*1..3]->(n:WorkTemplate)
+            WITH n,
+                 length(path) AS depth,
+                 [rel IN relationships(path) | startNode(rel).name] AS ancestors
+            RETURN n.name AS name,
+                   n.description AS description,
+                   depth,
+                   ancestors
+            ORDER BY depth
+            """
+            records = self.graph.query(query, {"project_name": project_name})
 
-        phase_agent = create_agent(
-            system_prompt=PHASE_AGENT_SYSTEM_PROMPT,
-            tools=phase_tools,
-            model=self.llm,
-        )
+            # Build nested dict: phases → packages → tasks
+            phases: Dict[str, Dict[str, list]] = {}  # phase -> {package -> [task, ...]}
+
+            for rec in records:
+                name = rec["name"]
+                desc = rec.get("description")
+                depth = rec["depth"]
+                ancestors = rec[
+                    "ancestors"
+                ]  # e.g. [project, phase] or [project, phase, package]
+
+                if depth == 1:
+                    # Phase level
+                    phases[name] = {}
+                elif depth == 2:
+                    # Package level — parent is the phase (ancestors[-1])
+                    phase_name = ancestors[-1]
+                    if phase_name in phases:
+                        phases[phase_name][name] = []
+                elif depth == 3:
+                    # Task level — grandparent is phase, parent is package
+                    phase_name = ancestors[-2] if len(ancestors) >= 2 else None
+                    package_name = ancestors[-1]
+                    if (
+                        phase_name
+                        and phase_name in phases
+                        and package_name in phases[phase_name]
+                    ):
+                        phases[phase_name][package_name].append(
+                            {"name": name, "description": desc}
+                        )
+
+            # Convert to JSON-friendly format
+            template = {
+                "project_name": project_name,
+                "phases": [
+                    {
+                        "name": phase,
+                        "packages": [
+                            {
+                                "name": pkg,
+                                "tasks": tasks,
+                            }
+                            for pkg, tasks in packages.items()
+                        ],
+                    }
+                    for phase, packages in phases.items()
+                ],
+            }
+            return template
+
+        def _adapt_wbs_with_llm(template: dict, user_intent) -> FullProjectWBS:
+            """
+            Single LLM call: given a reference template tree + user intent,
+            produce an adapted FullProjectWBS.
+            """
+            adapt_msg = HumanMessage(
+                content=f"""You are a construction WBS expert.
+
+            Here is a reference Work Breakdown Structure (WBS) template from a similar project:
+            {json.dumps(template, indent=2)}
+
+            The user's project details:
+            {json.dumps(user_intent, indent=2) if isinstance(user_intent, dict) else user_intent}
+
+            Adapt this WBS for the user's specific project:
+            - Remove phases, packages, or tasks that don't apply to this project
+            - Keep phases, packages, or tasks that are relevant
+            - You may slightly rename tasks if needed to better fit the project type
+            - Preserve the hierarchical structure: phases → packages → tasks
+            - Pay attention to any special instructions in the user's 'other_details' field (especially those addressed to 'phase_agent')
+            - Keep the project_name from the template as-is
+
+            Return the adapted WBS."""
+            )
+
+            structured_llm = self.llm.with_structured_output(FullProjectWBS)
+            result = structured_llm.invoke([adapt_msg])
+            return result  # type: ignore
+
+        def _format_wbs_for_display(wbs_data: dict) -> str:
+            """Format a WBS dict (from FullProjectWBS.model_dump()) for user display."""
+            lines = [f"📋 Proposed WBS (based on: {wbs_data['project_name']}):"]
+            for phase in wbs_data["phases"]:
+                lines.append(f"\n  📌 {phase['name']}")
+                for pkg in phase.get("packages", []):
+                    lines.append(f"    📦 {pkg['name']}")
+                    for task in pkg.get("tasks", []):
+                        desc = (
+                            f" — {task['description']}"
+                            if task.get("description")
+                            else ""
+                        )
+                        lines.append(f"      • {task['name']}{desc}")
+            return "\n".join(lines)
 
         def phase_node(state: AgentState) -> AgentState | Command:
 
             print("\n===== PHASE NODE =====\n")
 
             interrupted = state["interrupt"]
-            
-            
+
             if not interrupted:
-                # Normal flow - invoke the agent
+
                 sender = state["sender"]
 
                 if sender == "intent_agent":
                     user_intent = state["user_intent"]
 
-                    # Get the List of Major Phases in the Knowledge Graph
-                    KG_phases = self.graph.query("MATCH (n:Phase) RETURN n.name")
-
-                    task_name_list = [task["n.name"] for task in KG_phases]
-
-                    task_name_instructions = f"\n\n You may use the following task name when neccesary {task_name_list} to maintain consistency in naming"
-                    
-                    # Extract phase_agent-specific instructions from other_details
-                    phase_instructions = ""
-                    if isinstance(user_intent, dict):
-                        other_details = user_intent.get("other_details") or {}
-                        if "phase_agent" in other_details:
-                            phase_instructions = f"\n\n**User's specific instructions:** {other_details['phase_agent']}"
-
-                    # With KG
-                    initial_msg = HumanMessage(
-                        content=f"List the major phases in construction of {user_intent}{phase_instructions}{task_name_instructions}"
+                    # ── Step 1: Pick the most similar project (1 LLM call) ──
+                    print("Retrieving similar projects...")
+                    query1 = (
+                        """MATCH (p:WorkTemplate {level: "Project"}) RETURN p.name"""
                     )
+                    projects = self.graph.query(query1)
 
-                    # Without KG
-                    # initial_msg = HumanMessage(
-                    #     content=f"List the major phases in construction of {user_intent}{phase_instructions}"
-                    # )
+                    similar_project_msg = HumanMessage(
+                        content=f"Select the most similar project from {projects} that matches {user_intent}"
+                    )
+                    structured_llm = self.llm.with_structured_output(SelectedProject)
+                    result = structured_llm.invoke([similar_project_msg])  # type: ignore
+                    similar_project = result.project  # type: ignore
+                    print(f"  Selected template: {similar_project}")
 
-                    result = phase_agent.invoke({"messages": initial_msg})  # type: ignore
+                    # ── Step 2: Fetch full template tree (1 Cypher query) ──
+                    print("Fetching full template tree...")
+                    template = _fetch_full_template_tree(similar_project)
+                    print(f"  Template has {len(template['phases'])} phases")
 
-                else:
-                    result = phase_agent.invoke(state)  # type: ignore
+                    # ── Step 3: Adapt with LLM (1 LLM call) ──
+                    print("Adapting WBS for user's project...")
+                    adapted_wbs = _adapt_wbs_with_llm(template, user_intent)
+                    wbs_data = adapted_wbs.model_dump()
+                    print(f"  Adapted WBS has {len(wbs_data['phases'])} phases")
 
-                messages = result["messages"]
-                last_message = messages[-1]
-
-                # Check if the agent called confirm_phases tool
-                phases_tool_calls = extract_toolcall(messages, "confirm_phases")
-
-                if phases_tool_calls:
-                    tool_data = phases_tool_calls[-1]
-                    tool_call = tool_data["tool_call"]
-                    phases_list = tool_call["args"]["phases_list"]
-                    phases = [p.strip() for p in phases_list.split(",")]
-
-                    if hasattr(last_message, "content") and last_message.content:
-                        print(f"\n🤖 Assistant: {last_message.content}")
-
-                    # Store phases in cache, set interrupt, loop back
+                    # Store adapted WBS in cache and interrupt for user confirmation
                     return Command(
-                        update=AgentState(
-                            {
-                                **state,
-                                "sender": "phase_agent",
-                                "messages": [],
-                                "cache": {
-                                    "phases_data": phases,
-                                },
-                                "interrupt": True,
-                            }
-                        ),
+                        update={
+                            "sender": "phase_agent",
+                            "messages": [],
+                            "cache": {"wbs_data": wbs_data},
+                            "interrupt": True,
+                        },
                         goto="phase_agent",
                     )
 
                 else:
-                    # No tool call yet - agent is still asking questions
-                    if hasattr(last_message, "content") and last_message.content:
-                        print(f"\n🤖 Assistant: {last_message.content}")
+                    # Correction re-entry: user gave feedback, we re-adapt
+                    # The last HumanMessage contains the correction request
+                    # and the previous WBS is in cache
+                    state_cache = state.get("cache") or {}
+                    prev_wbs = state_cache.get("wbs_data")
+                    user_intent = state["user_intent"]
 
-                    return AgentState(
-                        {**state, "sender": "phase_agent", "messages": [last_message]}
-                    )
+                    if prev_wbs:
+                        # Get the latest user message (correction)
+                        last_user_msg = ""
+                        for msg in reversed(state["messages"]):
+                            if isinstance(msg, HumanMessage):
+                                last_user_msg = msg.content
+                                break
+
+                        correction_msg = HumanMessage(
+                            content=f"""You are a construction WBS expert.
+
+                            Here is the current Work Breakdown Structure (WBS) that was proposed:
+                            {json.dumps(prev_wbs, indent=2)}
+
+                            The user's project details:
+                            {json.dumps(user_intent, indent=2) if isinstance(user_intent, dict) else user_intent}
+
+                            The user wants the following changes:
+                            "{last_user_msg}"
+
+                            Apply the requested changes and return the COMPLETE updated WBS.
+                            Preserve the hierarchical structure: phases → packages → tasks."""
+                        )
+
+                        structured_llm = self.llm.with_structured_output(FullProjectWBS)
+                        result = structured_llm.invoke([correction_msg])
+                        wbs_data = result.model_dump()  # type: ignore
+
+                        return Command(
+                            update={
+                                "sender": "phase_agent",
+                                "messages": [],
+                                "cache": {"wbs_data": wbs_data},
+                                "interrupt": True,
+                            },
+                            goto="phase_agent",
+                        )
+                    else:
+                        # No previous WBS — shouldn't happen, but fallback
+                        return {"messages": [], "interrupt": False, "cache": {}}  # type: ignore
 
             else:
-                # Interrupted — show phases and ask for confirmation
+                # ── Interrupted: show adapted WBS and ask for confirmation ──
                 state_cache = state["cache"]
 
-                if state_cache and "phases_data" in state_cache:
-                    phases = state_cache["phases_data"]
+                if state_cache and "wbs_data" in state_cache:
+                    wbs_data = state_cache["wbs_data"]
+
+                    display_text = _format_wbs_for_display(wbs_data)
 
                     user_response = interrupt(
-                        f"📋 Proposed Phases:\n{chr(10).join([f'  • {p}' for p in phases])}\n\n"
+                        f"{display_text}\n\n"
                         "Please confirm:\n"
                         "• Type 'yes' or 'confirm' to proceed\n"
                         "• Type corrections if something needs to be changed\n"
@@ -592,21 +749,22 @@ class AgenticSchedulerModel:
 
                     if user_response_lower in ["yes", "confirm"]:
                         # ✅ User confirmed — proceed to details agent
-                        print(f"✓ Phases confirmed by user")
+                        print("✓ WBS confirmed by user")
+
+                        # Extract phase names for backward compatibility
+                        phase_names = [p["name"] for p in wbs_data["phases"]]
 
                         return Command(
-                            update=AgentState(
-                                {
-                                    **state,
-                                    "messages": [],
-                                    "sender": "phase_agent",
-                                    "current_stage": WorkflowStage.DETAILS.value,
-                                    "phases": phases,
-                                    "current_phase_index": 0,
-                                    "cache": {},
-                                    "interrupt": False,
-                                }
-                            ),
+                            update={
+                                "messages": [],
+                                "sender": "phase_agent",
+                                "current_stage": WorkflowStage.DETAILS.value,
+                                "phases": phase_names,
+                                "project_wbs": wbs_data,
+                                "current_phase_index": 0,
+                                "cache": {},
+                                "interrupt": False,
+                            },
                             goto="details_agent",
                         )
 
@@ -619,46 +777,41 @@ class AgenticSchedulerModel:
                         )
 
                         return Command(
-                            update=AgentState(
-                                {
-                                    **state,
-                                    "messages": [restart_msg],
-                                    "sender": "user",
-                                    "current_stage": WorkflowStage.PHASES.value,
-                                    "phases": [],
-                                    "current_phase_index": None,
-                                    "interrupt": False,
-                                    "cache": {},
-                                }
-                            ),
+                            update={
+                                "messages": [restart_msg],
+                                "sender": "user",
+                                "current_stage": WorkflowStage.PHASES.value,
+                                "phases": [],
+                                "project_wbs": None,
+                                "current_phase_index": None,
+                                "interrupt": False,
+                                "cache": {},
+                            },
                             goto=END,
                         )
 
                     else:
-                        # ✏️ User wants corrections — feed feedback back to phase agent
+                        # ✏️ User wants corrections — re-adapt via LLM
                         print(f"User requested corrections: {user_response_lower}")
 
                         correction_msg = HumanMessage(
-                            content=f"Please update the phases based on this feedback: {user_response}"
+                            content=f"Please update the WBS based on this feedback: {user_response}"
                         )
 
                         return Command(
-                            update=AgentState(
-                                {
-                                    **state,
-                                    "messages": [correction_msg],
-                                    "sender": "user",
-                                    "current_stage": WorkflowStage.PHASES.value,
-                                    "interrupt": False,
-                                    "cache": {},
-                                }
-                            ),
+                            update={
+                                "messages": [correction_msg],
+                                "sender": "user",
+                                "current_stage": WorkflowStage.PHASES.value,
+                                "interrupt": False,
+                                "cache": {
+                                    "wbs_data": wbs_data
+                                },  # Keep previous WBS for correction
+                            },
                             goto="phase_agent",
                         )
                 else:
-                    return AgentState(
-                        {**state, "messages": [], "interrupt": False, "cache": {}}
-                    )
+                    return {"messages": [], "interrupt": False, "cache": {}}  # type: ignore
 
         # Create Details Agent
         DETAIL_AGENT_SYSTEM_PROMPT = """
@@ -681,9 +834,9 @@ class AgenticSchedulerModel:
             phases = state["phases"]
             user_intent = state["user_intent"]
             generated_tasks = state.get("generated_tasks") or {}
+            state_cache = state["cache"]
 
             if not interrupted:
-                # ── Normal flow: generate tasks for the current phase ──
 
                 # Check if all phases are complete
                 if current_phase_idx is None or current_phase_idx >= len(phases):
@@ -696,60 +849,67 @@ class AgenticSchedulerModel:
                         }
                     )
 
-                current_phase = phases[current_phase_idx]
-                print(
-                    f"Processing phase {current_phase_idx + 1}/{len(phases)}: {current_phase}"
-                )
+                if state_cache and "sub_tasks" in state_cache:
+                    # TODO: If sub tasks are available then we have to handle it and generate task
+                    current_phase = phases[current_phase_idx]
+                    pass
+                else:
+                    current_phase = phases[current_phase_idx]
 
-                # Step 1: Query KG for known tasks in this phase
-                kg_query = f"What are the tasks for {current_phase} phase?"
-                try:
-                    kg_result = self.cypher_chain.invoke({"query": kg_query})
-                    kg_tasks = kg_result.get("result", "No template found")
-                    print(f"KG Tasks: {kg_tasks}")
-                except Exception as e:
-                    print(f"KG query failed: {e}")
-                    kg_tasks = "No template available"
-
-                # Step 2: Use RAG for additional context
-                try:
-                    rag_result = self.chain.invoke(
-                        {
-                            "input": f"What are the typical tasks for {current_phase} phase in construction?"
-                        }
+                    print(
+                        f"Processing phase {current_phase_idx + 1}/{len(phases)}: {current_phase}"
                     )
-                    rag_context = rag_result.get("answer", "")
-                    print(f"RAG Context: {rag_context}")
-                except Exception as e:
-                    print(f"RAG query failed: {e}")
-                    rag_context = ""
 
-                # Step 3: LLM generates detailed tasks USING KG as foundation
-                prompt = f"""
-                Generate detailed tasks for the "{current_phase}" phase of a construction project.
+                    # ── Read tasks from the adapted WBS (set by phase_node) ──
+                    project_wbs = state.get("project_wbs") or {}
+                    wbs_tasks_for_phase: list[dict] = []
 
-                KNOWN TASKS FROM DATABASE (use these as foundation):
-                {kg_tasks}
+                    for wbs_phase in project_wbs.get("phases", []):
+                        if wbs_phase["name"] == current_phase:
+                            for pkg in wbs_phase.get("packages", []):
+                                for task in pkg.get("tasks", []):
+                                    wbs_tasks_for_phase.append(task)
+                            break
 
-                ADDITIONAL CONTEXT:
-                {rag_context}
+                    if wbs_tasks_for_phase:
+                        task_names_str = ", ".join(
+                            t["name"] for t in wbs_tasks_for_phase
+                        )
+                        print(f"  WBS tasks for {current_phase}: {task_names_str}")
+                    else:
+                        print(
+                            f"  No WBS tasks found for {current_phase}, LLM will generate from scratch"
+                        )
 
-                PROJECT DETAILS: {user_intent}
+                    # ── LLM generates detailed tasks using WBS as foundation ──
+                    wbs_context = (
+                        f"\n\nReference tasks from the WBS template:\n{json.dumps(wbs_tasks_for_phase, indent=2)}"
+                        if wbs_tasks_for_phase
+                        else ""
+                    )
 
-                Return a structured list of tasks with:
-                - name: task name
-                - duration_days: estimated duration
-                - dependencies: list of [previous_task, relationship_type, lag_days]
-                - resources: list of [resource_name, amount]
-                """
+                    prompt = f"""
+                            Generate detailed tasks for the "{current_phase}" phase of a construction project.
 
-                try:
-                    result = self.llm.with_structured_output(TaskList).invoke(prompt)
-                    phase_tasks = [task.model_dump() for task in result.tasks]  # type: ignore
-                    print(f"Generated {len(phase_tasks)} tasks for {current_phase}")
-                except Exception as e:
-                    print(f"Task generation failed: {e}")
-                    phase_tasks = []
+                            PROJECT DETAILS: {user_intent}
+                            {wbs_context}
+
+                            Use the reference tasks as a starting point. For each task, provide:
+                            - name: task name
+                            - duration_days: estimated duration in days
+                            - dependencies: list of [previous_task, relationship_type, lag_days]
+                            - resources: list of [resource_name, amount]
+                            """
+
+                    try:
+                        result = self.llm.with_structured_output(TaskList).invoke(
+                            prompt
+                        )
+                        phase_tasks = [task.model_dump() for task in result.tasks]  # type: ignore
+                        print(f"Generated {len(phase_tasks)} tasks for {current_phase}")
+                    except Exception as e:
+                        print(f"Task generation failed: {e}")
+                        phase_tasks = []
 
                 # Store in cache and interrupt for user review
                 return Command(
@@ -769,8 +929,6 @@ class AgenticSchedulerModel:
                 )
 
             else:
-                # ── Interrupted: present tasks for user review ──
-                state_cache = state["cache"]
 
                 if state_cache and "pending_tasks" in state_cache:
                     pending_tasks = state_cache["pending_tasks"]
@@ -789,7 +947,7 @@ class AgenticSchedulerModel:
 
                     user_response = interrupt(
                         f'📋 Generated Tasks for "{phase_name}" '
-                        f"(Phase {current_phase_idx + 1}/{len(phases)}):\n" # type: ignore
+                        f"(Phase {current_phase_idx + 1}/{len(phases)}):\n"  # type: ignore
                         f"{task_list_str}\n\n"
                         "Please review:\n"
                         "• Type 'yes' or 'confirm' to accept and move to the next phase\n"
@@ -819,7 +977,7 @@ class AgenticSchedulerModel:
                                     "messages": [response_msg],
                                     "sender": "details_agent",
                                     "current_stage": WorkflowStage.DETAILS.value,
-                                    "current_phase_index": current_phase_idx + 1, # type: ignore
+                                    "current_phase_index": current_phase_idx + 1,  # type: ignore
                                     "generated_tasks": generated_tasks,
                                     "interrupt": False,
                                     "cache": {},
