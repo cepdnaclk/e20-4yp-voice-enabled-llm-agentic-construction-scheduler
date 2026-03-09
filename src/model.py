@@ -2,8 +2,14 @@ from pydantic.fields import Field
 from typing import Any, Dict, Optional
 import os
 import json
+import re
+import math
 import operator
 import uuid
+import time
+import logging
+
+logger = logging.getLogger(__name__)
 from pydantic.main import BaseModel
 from langgraph.types import Command, interrupt
 from enum import Enum
@@ -137,6 +143,30 @@ class Resource(BaseModel):
         return cls(name=res_list[0], amount=res_list[1])
 
 
+class VariableEntry(BaseModel):
+    """A single variable name-value pair"""
+
+    variable_name: str = Field(..., description="Name of the variable")
+    value: float = Field(..., description="Numeric value of the variable")
+
+
+class TaskVariableValue(BaseModel):
+    """A single variable value for a specific task"""
+
+    task_name: str = Field(..., description="Exact name of the task")
+    variable_entries: list[VariableEntry] = Field(
+        ..., description="List of variable name-value pairs for this task"
+    )
+
+
+class TaskVariableValues(BaseModel):
+    """Extracted variable values for all tasks from user response"""
+
+    task_values: list[TaskVariableValue] = Field(
+        ..., description="List of per-task variable values"
+    )
+
+
 class Task(BaseModel):
     """Represents a single task in the project schedule"""
 
@@ -211,19 +241,82 @@ class SelectedProject(BaseModel):
 
 class AgenticSchedulerModel:
 
+    # ── Neo4j retry configuration ──────────────────────────────────────────
+    NEO4J_MAX_RETRIES = 5  # total attempts
+    NEO4J_INITIAL_DELAY = 2.0  # seconds before first retry
+    NEO4J_BACKOFF_FACTOR = 2.0  # multiply delay by this on each failure
+
+    @staticmethod
+    def _connect_neo4j(
+        max_retries: int = 5,
+        initial_delay: float = 2.0,
+        backoff_factor: float = 2.0,
+    ) -> "Neo4jGraph":
+        """Create a Neo4jGraph connection with exponential-backoff retries.
+
+        Raises:
+            ConnectionError: if all attempts fail, with the last exception
+                             chained so callers (and the SSE error event) can
+                             surface a meaningful message to the user.
+        """
+        url = os.getenv("NEO4J_URI") or ""
+        username = os.getenv("NEO4J_USERNAME") or ""
+        password = os.getenv("NEO4J_PASSWORD") or ""
+        database = os.getenv("NEO4J_DATABASE") or ""
+
+        delay: float = float(initial_delay)
+        last_exc: Exception | None = None
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.info(
+                    "Neo4j connection attempt %d/%d to %s …",
+                    attempt,
+                    max_retries,
+                    url,
+                )
+                graph = Neo4jGraph(
+                    url=url,
+                    username=username,
+                    password=password,
+                    database=database,
+                )
+                logger.info("Neo4j connected successfully on attempt %d.", attempt)
+                return graph
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "Neo4j connection attempt %d/%d failed: %s",
+                    attempt,
+                    max_retries,
+                    exc,
+                )
+                if attempt < max_retries:
+                    logger.info("Retrying in %.1f second(s)…", delay)
+                    sleep_secs: float = float(delay)
+                    time.sleep(sleep_secs)
+                    delay = float(sleep_secs) * float(backoff_factor)
+
+        assert last_exc is not None  # always set — loop ran at least once
+        raise ConnectionError(
+            f"Could not connect to Neo4j at '{url}' after {max_retries} attempts. "
+            f"Last error: {last_exc}"
+        ) from last_exc
+
     def __init__(self):
         setup_tools(self)
         print(os.getenv("NEO4J_URI"))
         self.llm = ChatOpenAI(
             model=os.getenv("MODEL") or "",
             api_key=SecretStr(os.getenv("OPENAI_API_KEY") or ""),
+            timeout=60.0,
+            max_retries=1,
         )
 
-        self.graph = Neo4jGraph(
-            url=os.getenv("NEO4J_URI") or "",
-            username=os.getenv("NEO4J_USERNAME") or "",
-            password=os.getenv("NEO4J_PASSWORD") or "",
-            database=os.getenv("NEO4J_DATABASE") or "",
+        self.graph = self._connect_neo4j(
+            max_retries=self.NEO4J_MAX_RETRIES,
+            initial_delay=self.NEO4J_INITIAL_DELAY,
+            backoff_factor=self.NEO4J_BACKOFF_FACTOR,
         )
 
         # self.vector_index = Neo4jVector.from_existing_graph(
@@ -581,6 +674,108 @@ class AgenticSchedulerModel:
             }
             return template
 
+        def _fetch_required_task_and_task_details(
+            task_list: list,
+        ) -> list[dict]:
+            """
+            Fetch task details from Neo4j and extract required formula variables.
+
+            Returns:
+                tuple of (task_records, required_variables)
+                - task_records: list of dicts with keys from the Neo4j 't' node
+                - required_variables: dict mapping variable_name -> list of task names that need it
+            """
+            query = """
+            MATCH (:WorkTemplate)-[:HAS_CHILD]->(t:WorkTemplate)
+            WHERE t.name IN $task_names
+            RETURN t
+            """
+
+            records = self.graph.query(query, {"task_names": task_list})
+
+            # Extract the 't' node properties from each record
+            task_records = [rec["t"] for rec in records if "t" in rec]
+
+            required_variables: dict[str, list[str]] = {}
+
+            for t in task_records:
+                formula = t.get("formula", "")
+                task_name = t.get("name", "")
+                # Extract variable placeholders like {volume}, {area}
+                # Exclude {productivity} since it comes from the record itself
+                variables = re.findall(r"\{(\w+)\}", formula)
+                for var in variables:
+                    if var != "productivity":
+                        if var not in required_variables:
+                            required_variables[var] = []
+                        required_variables[var].append(task_name)
+
+            print(f"  Fetched {len(task_records)} task details from Neo4j")
+            print(f"  Required variables: {required_variables}")
+
+            return task_records
+
+        def _calculate_task_durations(
+            task_records: list[dict],
+            per_task_values: dict[str, dict[str, float]],
+        ) -> list[dict]:
+            """
+            Calculate duration_days for each task by evaluating its formula
+            with per-task variable values and the task's own productivity.
+
+            Args:
+                task_records: list of task dicts from Neo4j
+                per_task_values: dict mapping task_name -> {variable_name: value}
+
+            Returns a list of task dicts with computed duration_days.
+            """
+            computed_tasks = []
+
+            for t in task_records:
+                task_name = t.get("name", "")
+                formula = t.get("formula", "")
+                productivity = t.get("productivity", 1)
+                unit = t.get("unit", "")
+                optional = t.get("optional", False)
+
+                # Get this task's specific variable values
+                task_vars = per_task_values.get(task_name, {})
+                # Add productivity from the Neo4j record
+                eval_context = {**task_vars, "productivity": float(productivity)}
+
+                try:
+                    # Replace {var} placeholders with actual values for eval
+                    expression = formula
+                    for var_name, var_value in eval_context.items():
+                        expression = expression.replace(
+                            f"{{{var_name}}}", str(var_value)
+                        )
+
+                    # Evaluate the arithmetic expression safely
+                    duration = eval(expression)  # e.g. "1000.0/80.0" -> 12.5
+                    duration_days = math.ceil(duration)
+                    print(
+                        f"  {task_name}: {formula} -> {expression} = {duration:.2f} -> {duration_days} days"
+                    )
+                except Exception as e:
+                    print(f"  ⚠️ Failed to calculate duration for {task_name}: {e}")
+                    duration_days = 1  # Fallback
+
+                computed_tasks.append(
+                    {
+                        "name": task_name,
+                        "duration_days": duration_days,
+                        "unit": unit,
+                        "productivity": productivity,
+                        "formula": formula,
+                        "optional": optional,
+                        "dependencies": [],
+                        "resources": [],
+                    }
+                )
+
+            return computed_tasks
+
         def _adapt_wbs_with_llm(template: dict, user_intent) -> FullProjectWBS:
             """
             Single LLM call: given a reference template tree + user intent,
@@ -850,9 +1045,78 @@ class AgenticSchedulerModel:
                     )
 
                 if state_cache and "sub_tasks" in state_cache:
-                    # TODO: If sub tasks are available then we have to handle it and generate task
                     current_phase = phases[current_phase_idx]
-                    pass
+                    task = state_cache["sub_tasks"]
+
+                    # Extract just the name strings for the Cypher query
+                    task_names = [t["name"] if isinstance(t, dict) else t for t in task]
+
+                    # Fetch task details and required variables from Neo4j
+                    task_records = _fetch_required_task_and_task_details(task_names)
+
+                    # Build task summary for the LLM to generate smart questions
+                    task_summary_lines = []
+                    for t in task_records:
+                        formula = t.get("formula", "")
+                        variables = re.findall(r"\{(\w+)\}", formula)
+                        non_prod_vars = [v for v in variables if v != "productivity"]
+                        if non_prod_vars:
+                            task_summary_lines.append(
+                                f"- {t['name']}: formula='{formula}', "
+                                f"needs values for: {', '.join(non_prod_vars)}, "
+                                f"productivity={t.get('productivity')}, "
+                                f"unit={t.get('unit')}"
+                            )
+
+                    # LLM call 1: Generate context-aware questions
+                    question_prompt = HumanMessage(
+                        content=f"""
+                                The following tasks in the "{current_phase}" phase need measurements from the user to calculate their durations:
+
+                                {chr(10).join(task_summary_lines)}
+
+                                IMPORTANT: The same variable name (e.g., 'volume') can mean DIFFERENT things for different tasks.
+                                For example:
+                                - 'volume' for Excavation = volume of earth to excavate
+                                - 'volume' for RC Footing Concrete = volume of concrete to pour
+
+                                But:
+                                - 'number of foundation' in formwork, reinforcement and others are the same
+
+                                Generate a clear, numbered list of questions asking the user for each required measurement.
+                                - Be specific about WHAT is being measured for EACH task
+                                - Include the unit expected (m³, m², etc.) based on the task's unit field
+                                - Group truly identical values together (e.g., if the same floor area applies to multiple finishes)
+                                - **TRY TO GROUP THE REQUIRED VALUES AS MUCH AS POSSIBLE**
+                                - Keep it concise and construction-professional
+                                - If you GROUP together then do not ask them as seperate question, make it to a single question
+
+                                Return ONLY the numbered questions, nothing else."""  # noqa: E501
+                    )
+
+                    llm_questions = self.llm.invoke([question_prompt])
+                    question_text = llm_questions.content
+                    question_text = f"  LLM generated questions:\n{question_text}"
+
+                    return Command(
+                        update=AgentState(
+                            {
+                                **state,
+                                "sender": "details_agent",
+                                "messages": [],
+                                "cache": {
+                                    "awaiting_variables": True,
+                                    "task_records": task_records,
+                                    "current_phase": current_phase,
+                                    "question_text": question_text,
+                                    "task_summary_lines": task_summary_lines,
+                                },
+                                "interrupt": True,
+                            }
+                        ),
+                        goto="details_agent",
+                    )
+
                 else:
                     current_phase = phases[current_phase_idx]
 
@@ -881,56 +1145,101 @@ class AgenticSchedulerModel:
                             f"  No WBS tasks found for {current_phase}, LLM will generate from scratch"
                         )
 
-                    # ── LLM generates detailed tasks using WBS as foundation ──
-                    wbs_context = (
-                        f"\n\nReference tasks from the WBS template:\n{json.dumps(wbs_tasks_for_phase, indent=2)}"
-                        if wbs_tasks_for_phase
-                        else ""
+                    #         Use the reference tasks as a starting point. For each task, provide:
+                    #         - name: task name
+                    #         - duration_days: estimated duration in days
+                    #         - dependencies: list of [previous_task, relationship_type, lag_days]
+                    #         - resources: list of [resource_name, amount]
+                    #         """
+
+                    # Store in cache and interrupt for user review
+                    return Command(
+                        update=AgentState(
+                            {
+                                **state,
+                                "sender": "details_agent",
+                                "messages": [],
+                                "cache": {
+                                    "sub_tasks": wbs_tasks_for_phase,
+                                    "current_phase": current_phase,
+                                },
+                                "interrupt": False,
+                            }
+                        ),
+                        goto="details_agent",
                     )
-
-                    prompt = f"""
-                            Generate detailed tasks for the "{current_phase}" phase of a construction project.
-
-                            PROJECT DETAILS: {user_intent}
-                            {wbs_context}
-
-                            Use the reference tasks as a starting point. For each task, provide:
-                            - name: task name
-                            - duration_days: estimated duration in days
-                            - dependencies: list of [previous_task, relationship_type, lag_days]
-                            - resources: list of [resource_name, amount]
-                            """
-
-                    try:
-                        result = self.llm.with_structured_output(TaskList).invoke(
-                            prompt
-                        )
-                        phase_tasks = [task.model_dump() for task in result.tasks]  # type: ignore
-                        print(f"Generated {len(phase_tasks)} tasks for {current_phase}")
-                    except Exception as e:
-                        print(f"Task generation failed: {e}")
-                        phase_tasks = []
-
-                # Store in cache and interrupt for user review
-                return Command(
-                    update=AgentState(
-                        {
-                            **state,
-                            "sender": "details_agent",
-                            "messages": [],
-                            "cache": {
-                                "pending_tasks": phase_tasks,
-                                "current_phase": current_phase,
-                            },
-                            "interrupt": True,
-                        }
-                    ),
-                    goto="details_agent",
-                )
 
             else:
 
-                if state_cache and "pending_tasks" in state_cache:
+                if state_cache and state_cache.get("awaiting_variables"):
+                    # ── LLM-powered variable collection ──
+                    task_records = state_cache["task_records"]
+                    phase_name = state_cache["current_phase"]
+                    question_text = state_cache["question_text"]
+                    task_summary_lines = state_cache["task_summary_lines"]
+
+                    # Interrupt user with the LLM-generated questions
+                    user_response = interrupt(
+                        f'📐 To calculate task durations for "{phase_name}":\n\n'
+                        f"{question_text}"
+                    )
+                    print(f"  → User response: '{user_response}'")
+
+                    # LLM call 2: Parse user's free-text response into per-task values
+                    parse_prompt = HumanMessage(
+                        content=f"""You are a construction data parser.
+
+                                Here are the tasks and the variables each one needs:
+                                {chr(10).join(task_summary_lines)}
+
+                                Here are the questions that were asked:
+                                {question_text}
+
+                                Here is the user's response:
+                                "{user_response}"
+
+                                Extract the numeric values for EACH task's variables from the user's response.
+                                Each task needs its OWN variable values — do NOT share values between tasks unless the user explicitly says they are the same.
+                                Use the exact task names as listed above."""  # noqa: E501
+                    )
+
+                    structured_llm = self.llm.with_structured_output(TaskVariableValues)
+                    parsed_values: TaskVariableValues = structured_llm.invoke([parse_prompt])  # type: ignore
+
+                    # Convert to per_task_values dict
+                    per_task_values: dict[str, dict[str, float]] = {}
+                    for tv in parsed_values.task_values:
+                        per_task_values[tv.task_name] = {
+                            entry.variable_name: entry.value
+                            for entry in tv.variable_entries
+                        }
+
+                    print(f"  Parsed per-task values: {per_task_values}")
+
+                    # Calculate durations using per-task values
+                    print("  Calculating durations with per-task values...")
+                    computed_tasks = _calculate_task_durations(
+                        task_records, per_task_values
+                    )
+
+                    # Move to pending_tasks confirmation
+                    return Command(
+                        update=AgentState(
+                            {
+                                **state,
+                                "sender": "details_agent",
+                                "messages": [],
+                                "cache": {
+                                    "pending_tasks": computed_tasks,
+                                    "current_phase": phase_name,
+                                },
+                                "interrupt": True,
+                            }
+                        ),
+                        goto="details_agent",
+                    )
+
+                elif state_cache and "pending_tasks" in state_cache:
                     pending_tasks = state_cache["pending_tasks"]
                     phase_name = state_cache["current_phase"]
 
