@@ -71,50 +71,12 @@ def sse_event(event: str, data: dict) -> str:
 
 @app.post("/api/chat/start")
 async def start_chat():
-    """Create a new chat session and get initial AI greeting."""
-    model = get_model()
+    """Create a new chat session. Does NOT invoke the graph — the graph is triggered by the first user message."""
+    # Just create a thread ID; no graph invocation here.
     thread_id = str(uuid.uuid4())
-    config = RunnableConfig(configurable={"thread_id": thread_id}, recursion_limit=50)
-
-    initial_state: AgentState = {
-        "messages": [SystemMessage(content="")],
-        "sender": "user",
-        "current_stage": WorkflowStage.INTENT.value,
-        "phases": [],
-        "user_intent": None,
-        "current_phase_index": None,
-        "generated_tasks": {},
-        "schedule_result": [],
-        "interrupt": False,
-        "cache": {},
-    }
-
-    # Run initial invoke in a thread to not block the event loop
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(
-        None, lambda: model.workflow.invoke(initial_state, config=config)
-    )
-
-    # Get state to extract AI message
-    state_snapshot = model.workflow.get_state(config)
-    state_values = state_snapshot.values
-
-    # Extract the last AI message
-    ai_message = ""
-    interrupt_value = None
-    messages = state_values.get("messages", [])
-    for msg in reversed(messages):
-        if isinstance(msg, AIMessage) and msg.content:
-            ai_message = msg.content
-            break
 
     return {
         "thread_id": thread_id,
-        "message": ai_message,
-        "interrupt": interrupt_value,
-        "stage": state_values.get("current_stage", "intent"),
-        "phases": state_values.get("phases", []),
-        "generated_tasks": state_values.get("generated_tasks", {}),
     }
 
 

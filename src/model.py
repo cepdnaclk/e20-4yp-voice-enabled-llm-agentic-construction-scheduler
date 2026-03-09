@@ -408,7 +408,7 @@ class AgenticSchedulerModel:
             state: AgentState,
         ) -> Literal["intent_agent", "phase_agent", "details_agent"]:
 
-            current_stage = state["current_stage"]
+            current_stage = state.get("current_stage", WorkflowStage.INTENT.value)
 
             if current_stage == WorkflowStage.INTENT.value:
                 return "intent_agent"
@@ -417,7 +417,7 @@ class AgenticSchedulerModel:
             elif current_stage == WorkflowStage.DETAILS.value:
                 return "details_agent"
             else:
-                return "phase_agent"
+                return "intent_agent"
 
         def extract_toolcall(messages, toolname: str):
 
@@ -436,7 +436,7 @@ class AgenticSchedulerModel:
             print("\n===== INTENT NODE =====\n")
 
             # To check if the graph is interuppted
-            interrupted = state["interrupt"]
+            interrupted = state.get("interrupt", False)
 
             if not interrupted:
                 # Normal flow - invoke the agent
@@ -1514,7 +1514,8 @@ class AgenticSchedulerModel:
         def intent_exit_router(state: AgentState):
             return (
                 "phase_agent"
-                if state["current_stage"] == WorkflowStage.PHASES.value
+                if state.get("current_stage", WorkflowStage.INTENT.value)
+                == WorkflowStage.PHASES.value
                 else END
             )
 
