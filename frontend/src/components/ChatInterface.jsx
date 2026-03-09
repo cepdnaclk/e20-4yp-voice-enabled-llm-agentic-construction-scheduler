@@ -24,6 +24,9 @@ function ChatInterface({ messages, onSend, isLoading, isInitializing, pendingInt
         if (text) {
             onSend(text);
             inputRef.current.value = '';
+            if (inputRef.current) {
+                inputRef.current.style.height = 'auto';
+            }
         }
     };
 
@@ -78,9 +81,9 @@ function ChatInterface({ messages, onSend, isLoading, isInitializing, pendingInt
             <div className="input-area">
                 <form onSubmit={handleSubmit} className="input-form">
                     <div className="input-wrapper">
-                        <input
+                        <textarea
                             ref={inputRef}
-                            type="text"
+                            rows={1}
                             placeholder={
                                 isInitializing
                                     ? 'Connecting...'
@@ -90,6 +93,10 @@ function ChatInterface({ messages, onSend, isLoading, isInitializing, pendingInt
                             }
                             disabled={isLoading || isInitializing}
                             onKeyDown={handleKeyDown}
+                            onInput={(e) => {
+                                e.target.style.height = 'auto';
+                                e.target.style.height = Math.min(e.target.scrollHeight, 150) + 'px';
+                            }}
                             className="chat-input"
                         />
                         <button
