@@ -1,0 +1,90 @@
+[
+    {
+        "id": "h001",
+        "description": "Framing for a 2-story residential house, standard layout.",
+        "type": "Framing",
+        "quantity": 2500,
+        "unit": "sqft",
+        "crew_size": 4,
+        "actual_duration_days": 12.0,
+        "conditions": [
+            "Summer",
+            "Good Access"
+        ]
+    },
+    {
+        "id": "h002",
+        "description": "Framing for a custom cabin with steep roof pitch.",
+        "type": "Framing",
+        "quantity": 1200,
+        "unit": "sqft",
+        "crew_size": 3,
+        "actual_duration_days": 8.0,
+        "conditions": [
+            "Remote",
+            "Complex Roof"
+        ]
+    },
+    {
+        "id": "h003",
+        "description": "Concrete foundation slab on grade, 20x30 ft.",
+        "type": "Foundation",
+        "quantity": 25,
+        "unit": "cubic_yards",
+        "crew_size": 3,
+        "actual_duration_days": 2.0,
+        "conditions": [
+            "Easy Access"
+        ]
+    },
+    {
+        "id": "h004",
+        "description": "Deep foundation pour with rebar in rainy season.",
+        "type": "Foundation",
+        "quantity": 100,
+        "unit": "cubic_yards",
+        "crew_size": 5,
+        "actual_duration_days": 7.5,
+        "conditions": [
+            "Rain",
+            "Deep Trenching"
+        ]
+    },
+    {
+        "id": "h005",
+        "description": "Roofing shingles for rapid residential build.",
+        "type": "Roofing",
+        "quantity": 3000,
+        "unit": "sqft",
+        "crew_size": 4,
+        "actual_duration_days": 4.0,
+        "conditions": [
+            "Standard"
+        ]
+    },
+    {
+        "id": "h006",
+        "description": "Complex framing with multiple dormers and valley flashing.",
+        "type": "Framing",
+        "quantity": 3500,
+        "unit": "sqft",
+        "crew_size": 5,
+        "actual_duration_days": 22.0,
+        "conditions": [
+            "Complex"
+        ]
+    },
+    {
+        "id": "h007",
+        "description": "Winter foundation work with hearing blankets required.",
+        "type": "Foundation",
+        "quantity": 200,
+        "unit": "cubic_yards",
+        "crew_size": 6,
+        "actual_duration_days": 14.0,
+        "conditions": [
+            "Winter",
+            "Frozen Ground"
+        ]
+    }
+]

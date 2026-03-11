@@ -1,0 +1,12 @@
+{
+  "id": "test-1",
+  "name": "Test Framing",
+  "type": "framing",
+  "quantity": 1000,
+  "unit": "sqft",
+  "complexity_description": "Standard framing for a residential building in a suburban area. It is a rainy season.",
+  "resources": {
+    "crew_size": 2
+  },
+  "target_start_date": "2025-12-25"
+}

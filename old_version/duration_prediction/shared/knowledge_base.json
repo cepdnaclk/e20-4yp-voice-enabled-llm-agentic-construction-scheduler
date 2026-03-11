@@ -1,0 +1,20 @@
+{
+  "custom_rates": {
+    "framing": 45.0,
+    "foundation": 8.0,
+    "drywall": 60.0,
+    "flooring": 55.0,
+    "roofing": 25.0,
+    "painting": 100.0,
+    "plumbing": 5.0,
+    "electrical": 6.0,
+    "hvac": 4.0,
+    "landscaping": 15.0
+  },
+  "risk_factors": {
+    "rain": 0.9,
+    "snow": 0.7,
+    "high_wind": 0.75,
+    "extreme_heat": 0.85
+  }
+}
