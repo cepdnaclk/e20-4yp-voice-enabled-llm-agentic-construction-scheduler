@@ -131,6 +131,17 @@ class Dependency(BaseModel):
         )
 
 
+class SelectedDependency(BaseModel):
+    """LLM-selected dependency when graph traversal yields ambiguous results"""
+
+    predecessor: str = Field(..., description="Name of the selected predecessor task")
+    relationship_type: str = Field(
+        ..., description="Relationship type: FS, FF, SS, or SF"
+    )
+    lag: int = Field(default=0, description="Lag in days")
+    reasoning: str = Field(..., description="Why this predecessor was selected")
+
+
 class Resource(BaseModel):
     """Represents a required resource"""
 
@@ -678,12 +689,10 @@ class AgenticSchedulerModel:
             task_list: list,
         ) -> list[dict]:
             """
-            Fetch task details from Neo4j and extract required formula variables.
+            Fetch task details from Neo4j and extract required task_duration formula variables.
 
             Returns:
-                tuple of (task_records, required_variables)
                 - task_records: list of dicts with keys from the Neo4j 't' node
-                - required_variables: dict mapping variable_name -> list of task names that need it
             """
             query = """
             MATCH (:WorkTemplate)-[:HAS_CHILD]->(t:WorkTemplate)
@@ -699,11 +708,11 @@ class AgenticSchedulerModel:
             required_variables: dict[str, list[str]] = {}
 
             for t in task_records:
-                formula = t.get("formula", "")
+                task_duration = t.get("task_duration", "")
                 task_name = t.get("name", "")
                 # Extract variable placeholders like {volume}, {area}
                 # Exclude {productivity} since it comes from the record itself
-                variables = re.findall(r"\{(\w+)\}", formula)
+                variables = re.findall(r"\{(\w+)\}", str(task_duration))
                 for var in variables:
                     if var != "productivity":
                         if var not in required_variables:
@@ -733,7 +742,7 @@ class AgenticSchedulerModel:
 
             for t in task_records:
                 task_name = t.get("name", "")
-                formula = t.get("formula", "")
+                task_duration = t.get("task_duration", "")
                 productivity = t.get("productivity", 1)
                 unit = t.get("unit", "")
                 optional = t.get("optional", False)
@@ -745,7 +754,7 @@ class AgenticSchedulerModel:
 
                 try:
                     # Replace {var} placeholders with actual values for eval
-                    expression = formula
+                    expression = task_duration
                     for var_name, var_value in eval_context.items():
                         expression = expression.replace(
                             f"{{{var_name}}}", str(var_value)
@@ -755,7 +764,7 @@ class AgenticSchedulerModel:
                     duration = eval(expression)  # e.g. "1000.0/80.0" -> 12.5
                     duration_days = math.ceil(duration)
                     print(
-                        f"  {task_name}: {formula} -> {expression} = {duration:.2f} -> {duration_days} days"
+                        f"  {task_name}: {task_duration} -> {expression} = {duration:.2f} -> {duration_days} days"
                     )
                 except Exception as e:
                     print(f"  ⚠️ Failed to calculate duration for {task_name}: {e}")
@@ -767,14 +776,245 @@ class AgenticSchedulerModel:
                         "duration_days": duration_days,
                         "unit": unit,
                         "productivity": productivity,
-                        "formula": formula,
+                        "task_duration": task_duration,
                         "optional": optional,
                         "dependencies": [],
                         "resources": [],
                     }
                 )
 
+            # ── Resolve dependencies from knowledge graph ──
+            task_names = [t["name"] for t in computed_tasks]
+            try:
+                dependency_map = _resolve_task_dependencies(task_names)
+                for task in computed_tasks:
+                    deps = dependency_map.get(task["name"], [])
+                    task["dependencies"] = deps
+                    if deps:
+                        print(
+                            f"  📎 {task['name']} depends on: "
+                            + ", ".join(f"{d[0]} ({d[1]}, lag={d[2]})" for d in deps)
+                        )
+            except Exception as e:
+                print(f"  ⚠️ Dependency resolution failed: {e}")
+                # Tasks will keep their empty dependencies — scheduler
+                # still works (just no inter-task constraints)
+
             return computed_tasks
+
+        def _fetch_task_dependencies(
+            task_names: list[str],
+        ) -> dict[str, list]:
+            """
+            Query direct PRECEDES relationships between tasks that are
+            both present in the user's task list.
+
+            Returns:
+                dict mapping successor_name -> list of
+                [predecessor_name, rel_type, lag]
+            """
+            query = """
+            MATCH (a:WorkTemplate)-[r:PRECEDES]->(b:WorkTemplate)
+            WHERE a.name IN $task_names AND b.name IN $task_names
+            RETURN a.name AS predecessor, b.name AS successor,
+                   r.type AS rel_type, r.lag AS lag
+            """
+            records = self.graph.query(query, {"task_names": task_names})
+
+            dep_map: dict[str, list] = {}
+            for rec in records:
+                successor = rec["successor"]
+                pred = rec["predecessor"]
+                rel_type = rec.get("rel_type", "FS") or "FS"
+                lag = int(rec.get("lag", 0) or 0)
+                dep_map.setdefault(successor, []).append([pred, rel_type, lag])
+
+            print(
+                f"  Found {sum(len(v) for v in dep_map.values())} direct "
+                f"PRECEDES relationships among {len(task_names)} tasks"
+            )
+            return dep_map
+
+        def _resolve_missing_dependencies(
+            task_names: list[str],
+            direct_dep_map: dict[str, list],
+        ) -> dict[str, list]:
+            """
+            For tasks whose graph predecessors are NOT in task_names,
+            traverse backward through PRECEDES chains to find the
+            nearest ancestor that IS in the user's task list.
+
+            Uses an LLM call when multiple candidates exist at the
+            same hop distance.
+
+            Returns:
+                dict mapping successor_name -> list of
+                [predecessor_name, rel_type, lag]  (resolved entries only)
+            """
+            # 1. Find tasks that have a PRECEDES predecessor in the graph
+            #    but that predecessor is NOT in our task list.
+            query_missing = """
+            MATCH (a:WorkTemplate)-[r:PRECEDES]->(b:WorkTemplate)
+            WHERE b.name IN $task_names AND NOT a.name IN $task_names
+            RETURN b.name AS successor, a.name AS missing_pred,
+                   r.type AS rel_type, r.lag AS lag
+            """
+            records = self.graph.query(query_missing, {"task_names": task_names})
+
+            if not records:
+                return {}
+
+            # Collect which successors have missing predecessors
+            missing_successors = set()
+            for rec in records:
+                # Only treat as "missing" if the successor doesn't
+                # already have a direct (present) predecessor
+                successor = rec["successor"]
+                if successor not in direct_dep_map:
+                    missing_successors.add(successor)
+
+            if not missing_successors:
+                return {}
+
+            print(
+                f"  🔍 {len(missing_successors)} task(s) have predecessors "
+                f"not in the current list — traversing graph..."
+            )
+
+            # 2. For each missing-predecessor task, traverse backward
+            resolved: dict[str, list] = {}
+            task_names_set = set(task_names)
+
+            for successor in missing_successors:
+                query_traverse = """
+                MATCH path = (ancestor:WorkTemplate)
+                              -[:PRECEDES*1..5]->
+                              (target:WorkTemplate {name: $task_name})
+                WHERE ancestor.name IN $task_names
+                RETURN ancestor.name AS found_predecessor,
+                       length(path)   AS hops,
+                       [r IN relationships(path) |
+                           {type: r.type, lag: r.lag}] AS chain
+                ORDER BY hops ASC
+                """
+                candidates = self.graph.query(
+                    query_traverse,
+                    {
+                        "task_name": successor,
+                        "task_names": task_names,
+                    },
+                )
+
+                if not candidates:
+                    print(
+                        f"    ⚠️ No reachable predecessor found for "
+                        f"'{successor}' within 5 hops"
+                    )
+                    continue
+
+                # Take the shortest-hop candidates
+                min_hops = candidates[0]["hops"]
+                best = [c for c in candidates if c["hops"] == min_hops]
+
+                if len(best) == 1:
+                    # Unambiguous — use the chain's first relationship
+                    # type and cumulative lag
+                    chain = best[0]["chain"]
+                    rel_type = chain[-1].get("type", "FS") or "FS"
+                    total_lag = sum(int(link.get("lag", 0) or 0) for link in chain)
+                    resolved.setdefault(successor, []).append(
+                        [best[0]["found_predecessor"], rel_type, total_lag]
+                    )
+                    print(
+                        f"    ✔ '{successor}' → resolved to "
+                        f"'{best[0]['found_predecessor']}' "
+                        f"({rel_type}, lag={total_lag}, "
+                        f"{min_hops} hop(s))"
+                    )
+                else:
+                    # Ambiguous — ask LLM to choose
+                    selected = _llm_select_dependency(successor, best)
+                    resolved.setdefault(successor, []).append(
+                        [
+                            selected.predecessor,
+                            selected.relationship_type,
+                            selected.lag,
+                        ]
+                    )
+                    print(
+                        f"    🤖 '{successor}' → LLM selected "
+                        f"'{selected.predecessor}' "
+                        f"({selected.relationship_type}, "
+                        f"lag={selected.lag}) — "
+                        f"{selected.reasoning}"
+                    )
+
+            return resolved
+
+        def _llm_select_dependency(
+            task_name: str,
+            candidates: list[dict],
+        ) -> SelectedDependency:
+            """
+            Use the LLM to select the best predecessor when graph
+            traversal finds multiple candidates at the same distance.
+            """
+            candidate_descriptions = []
+            for c in candidates:
+                chain = c["chain"]
+                rel_type = chain[-1].get("type", "FS") or "FS"
+                total_lag = sum(int(link.get("lag", 0) or 0) for link in chain)
+                candidate_descriptions.append(
+                    f"- {c['found_predecessor']} "
+                    f"(relationship: {rel_type}, "
+                    f"cumulative lag: {total_lag} days, "
+                    f"hops: {c['hops']})"
+                )
+
+            prompt = HumanMessage(
+                content=f"""You are a construction scheduling expert.
+
+                The task "{task_name}" needs a predecessor dependency, but its
+                immediate predecessor was removed from the schedule.
+
+                After traversing the knowledge graph, the following candidate
+                predecessors were found at the same distance:
+
+                {chr(10).join(candidate_descriptions)}
+
+                Select the BEST predecessor for "{task_name}" based on
+                construction sequencing logic. Consider which activity must
+                logically complete (or start) before "{task_name}" can proceed.
+
+                Return your selection with the relationship type and lag."""
+            )
+
+            structured_llm = self.llm.with_structured_output(SelectedDependency)
+            result: SelectedDependency = structured_llm.invoke([prompt])  # type: ignore
+            return result
+
+        def _resolve_task_dependencies(
+            task_names: list[str],
+        ) -> dict[str, list]:
+            """
+            Master function: fetch direct dependencies, then resolve
+            any missing predecessors via graph traversal + LLM.
+
+            Returns:
+                dict mapping task_name -> list of
+                [predecessor, rel_type, lag]
+            """
+            # Step 1: Direct dependencies (both tasks present)
+            direct = _fetch_task_dependencies(task_names)
+
+            # Step 2: Resolve missing predecessors
+            resolved = _resolve_missing_dependencies(task_names, direct)
+
+            # Merge resolved into direct
+            for successor, deps in resolved.items():
+                direct.setdefault(successor, []).extend(deps)
+
+            return direct
 
         def _adapt_wbs_with_llm(template: dict, user_intent) -> FullProjectWBS:
             """
@@ -1057,12 +1297,12 @@ class AgenticSchedulerModel:
                     # Build task summary for the LLM to generate smart questions
                     task_summary_lines = []
                     for t in task_records:
-                        formula = t.get("formula", "")
-                        variables = re.findall(r"\{(\w+)\}", formula)
+                        task_duration = t.get("task_duration", "")
+                        variables = re.findall(r"\{(\w+)\}", str(task_duration))
                         non_prod_vars = [v for v in variables if v != "productivity"]
                         if non_prod_vars:
                             task_summary_lines.append(
-                                f"- {t['name']}: formula='{formula}', "
+                                f"- {t['name']}: task_duration='{task_duration}', "
                                 f"needs values for: {', '.join(non_prod_vars)}, "
                                 f"productivity={t.get('productivity')}, "
                                 f"unit={t.get('unit')}"
