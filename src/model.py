@@ -1,9 +1,15 @@
 from pydantic.fields import Field
-from typing import Optional
+from typing import Any, Dict, Optional
 import os
 import json
+import re
+import math
 import operator
 import uuid
+import time
+import logging
+
+logger = logging.getLogger(__name__)
 from pydantic.main import BaseModel
 from langgraph.types import Command, interrupt
 from enum import Enum
@@ -42,6 +48,9 @@ class AgentState(TypedDict):
     sender: Annotated[str, "The sender of last message"]
     current_stage: str
     phases: list
+    project_wbs: Optional[
+        dict
+    ]  # Full WBS from phase_node (FullProjectWBS.model_dump())
     user_intent: Optional[str | dict]
     current_phase_index: Optional[int]
     generated_tasks: Optional[dict]  # Store tasks by phase name
@@ -122,6 +131,17 @@ class Dependency(BaseModel):
         )
 
 
+class SelectedDependency(BaseModel):
+    """LLM-selected dependency when graph traversal yields ambiguous results"""
+
+    predecessor: str = Field(..., description="Name of the selected predecessor task")
+    relationship_type: str = Field(
+        ..., description="Relationship type: FS, FF, SS, or SF"
+    )
+    lag: int = Field(default=0, description="Lag in days")
+    reasoning: str = Field(..., description="Why this predecessor was selected")
+
+
 class Resource(BaseModel):
     """Represents a required resource"""
 
@@ -132,6 +152,30 @@ class Resource(BaseModel):
     def from_list(cls, res_list: List) -> "Resource":
         """Create from [resource_name, amount] format"""
         return cls(name=res_list[0], amount=res_list[1])
+
+
+class VariableEntry(BaseModel):
+    """A single variable name-value pair"""
+
+    variable_name: str = Field(..., description="Name of the variable")
+    value: float = Field(..., description="Numeric value of the variable")
+
+
+class TaskVariableValue(BaseModel):
+    """A single variable value for a specific task"""
+
+    task_name: str = Field(..., description="Exact name of the task")
+    variable_entries: list[VariableEntry] = Field(
+        ..., description="List of variable name-value pairs for this task"
+    )
+
+
+class TaskVariableValues(BaseModel):
+    """Extracted variable values for all tasks from user response"""
+
+    task_values: list[TaskVariableValue] = Field(
+        ..., description="List of per-task variable values"
+    )
 
 
 class Task(BaseModel):
@@ -162,7 +206,113 @@ class TaskList(BaseModel):
     tasks: List[Task] = Field(..., description="List of tasks")
 
 
+class WBS_Phases(BaseModel):
+    """Collection of WBS Major phase for the current project"""
+
+    phases: List[str] = Field(..., description="List of WBS phases for current project")
+
+
+class WBSTask(BaseModel):
+    """A single task within a work package"""
+
+    name: str = Field(..., description="Task name")
+    description: str | None = Field(None, description="Brief task description")
+
+
+class WBSPackage(BaseModel):
+    """A work package containing tasks"""
+
+    name: str = Field(..., description="Work package name")
+    tasks: list[WBSTask] = Field(
+        default_factory=list, description="Tasks in this package"
+    )
+
+
+class WBSPhase(BaseModel):
+    """A project phase containing work packages"""
+
+    name: str = Field(..., description="Phase name")
+    packages: list[WBSPackage] = Field(
+        default_factory=list, description="Work packages in this phase"
+    )
+
+
+class FullProjectWBS(BaseModel):
+    """Complete Work Breakdown Structure adapted for the user's project"""
+
+    project_name: str = Field(..., description="Name of the reference project template")
+    phases: list[WBSPhase] = Field(
+        ..., description="Adapted phases with packages and tasks"
+    )
+
+
+class SelectedProject(BaseModel):
+    project: str
+
+
 class AgenticSchedulerModel:
+
+    # ── Neo4j retry configuration ──────────────────────────────────────────
+    NEO4J_MAX_RETRIES = 5  # total attempts
+    NEO4J_INITIAL_DELAY = 2.0  # seconds before first retry
+    NEO4J_BACKOFF_FACTOR = 2.0  # multiply delay by this on each failure
+
+    @staticmethod
+    def _connect_neo4j(
+        max_retries: int = 5,
+        initial_delay: float = 2.0,
+        backoff_factor: float = 2.0,
+    ) -> "Neo4jGraph":
+        """Create a Neo4jGraph connection with exponential-backoff retries.
+
+        Raises:
+            ConnectionError: if all attempts fail, with the last exception
+                             chained so callers (and the SSE error event) can
+                             surface a meaningful message to the user.
+        """
+        url = os.getenv("NEO4J_URI") or ""
+        username = os.getenv("NEO4J_USERNAME") or ""
+        password = os.getenv("NEO4J_PASSWORD") or ""
+        database = os.getenv("NEO4J_DATABASE") or ""
+
+        delay: float = float(initial_delay)
+        last_exc: Exception | None = None
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.info(
+                    "Neo4j connection attempt %d/%d to %s …",
+                    attempt,
+                    max_retries,
+                    url,
+                )
+                graph = Neo4jGraph(
+                    url=url,
+                    username=username,
+                    password=password,
+                    database=database,
+                )
+                logger.info("Neo4j connected successfully on attempt %d.", attempt)
+                return graph
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "Neo4j connection attempt %d/%d failed: %s",
+                    attempt,
+                    max_retries,
+                    exc,
+                )
+                if attempt < max_retries:
+                    logger.info("Retrying in %.1f second(s)…", delay)
+                    sleep_secs: float = float(delay)
+                    time.sleep(sleep_secs)
+                    delay = float(sleep_secs) * float(backoff_factor)
+
+        assert last_exc is not None  # always set — loop ran at least once
+        raise ConnectionError(
+            f"Could not connect to Neo4j at '{url}' after {max_retries} attempts. "
+            f"Last error: {last_exc}"
+        ) from last_exc
 
     def __init__(self):
         setup_tools(self)
@@ -170,25 +320,26 @@ class AgenticSchedulerModel:
         self.llm = ChatOpenAI(
             model=os.getenv("MODEL") or "",
             api_key=SecretStr(os.getenv("OPENAI_API_KEY") or ""),
+            timeout=60.0,
+            max_retries=1,
         )
 
-        self.graph = Neo4jGraph(
-            url=os.getenv("NEO4J_URI") or "",
-            username=os.getenv("NEO4J_USERNAME") or "",
-            password=os.getenv("NEO4J_PASSWORD") or "",
-            database=os.getenv("NEO4J_DATABASE") or "",
+        self.graph = self._connect_neo4j(
+            max_retries=self.NEO4J_MAX_RETRIES,
+            initial_delay=self.NEO4J_INITIAL_DELAY,
+            backoff_factor=self.NEO4J_BACKOFF_FACTOR,
         )
 
-        self.vector_index = Neo4jVector.from_existing_graph(
-            OpenAIEmbeddings(),
-            url=os.getenv("NEO4J_URI") or "",
-            username=os.getenv("NEO4J_USERNAME") or "",
-            password=os.getenv("NEO4J_PASSWORD") or "",
-            index_name="task",
-            node_label="Subtask",
-            text_node_properties=["name", "description"],
-            embedding_node_property="embedding",
-        )
+        # self.vector_index = Neo4jVector.from_existing_graph(
+        #     OpenAIEmbeddings(),
+        #     url=os.getenv("NEO4J_URI") or "",
+        #     username=os.getenv("NEO4J_USERNAME") or "",
+        #     password=os.getenv("NEO4J_PASSWORD") or "",
+        #     index_name="task",
+        #     node_label="Subtask",
+        #     text_node_properties=["name", "description"],
+        #     embedding_node_property="embedding",
+        # )
 
         # TODO find better alternative to allow_dangerous_requests=True
         self.cypher_chain = GraphCypherQAChain.from_llm(
@@ -196,7 +347,7 @@ class AgenticSchedulerModel:
         )
 
         # TODO vectorizing the graph
-        retriever = self.vector_index.as_retriever()
+        # retriever = self.vector_index.as_retriever()
 
         llm = ChatOpenAI(temperature=0)
 
@@ -213,7 +364,7 @@ class AgenticSchedulerModel:
 
         document_chain = create_stuff_documents_chain(llm, prompt)
 
-        self.chain = create_retrieval_chain(retriever, document_chain)
+        # self.chain = create_retrieval_chain(retriever, document_chain)
 
         self.workflow = self._build_workflow()
         self._visualize_graph()
@@ -268,7 +419,7 @@ class AgenticSchedulerModel:
             state: AgentState,
         ) -> Literal["intent_agent", "phase_agent", "details_agent"]:
 
-            current_stage = state["current_stage"]
+            current_stage = state.get("current_stage", WorkflowStage.INTENT.value)
 
             if current_stage == WorkflowStage.INTENT.value:
                 return "intent_agent"
@@ -277,7 +428,7 @@ class AgenticSchedulerModel:
             elif current_stage == WorkflowStage.DETAILS.value:
                 return "details_agent"
             else:
-                return "phase_agent"
+                return "intent_agent"
 
         def extract_toolcall(messages, toolname: str):
 
@@ -296,7 +447,7 @@ class AgenticSchedulerModel:
             print("\n===== INTENT NODE =====\n")
 
             # To check if the graph is interuppted
-            interrupted = state["interrupt"]
+            interrupted = state.get("interrupt", False)
 
             if not interrupted:
                 # Normal flow - invoke the agent
@@ -465,105 +616,561 @@ class AgenticSchedulerModel:
                 {**state, "messages": [], "interrupt": False, "cache": {}}
             )
 
-        # Create Phase Agent
-        PHASE_AGENT_SYSTEM_PROMPT = """
-            You are a construction scheduling assistant. 
-            - List the major phases for the project based on the user's intent.
-            - No pre-construction phases are required (except Site Preparation).
-            - Don't List any task or subtasks in the phases. Only the major phases
-            - Call the "confirm_phases" tool if neccesary major tasks are known.
-            
-            **IMPORTANT:** Pay close attention to any special instructions from the user.
-            For example:
-            - If the user says "plan only the foundation phase", list ONLY that phase.
-            - If the user says "plan up to structural phase", list phases only up to that point.
-            - If there are specific notes addressed to you (phase_agent), follow them.
-            - Adapt the phases list to match exactly what the user requested.
+        def _fetch_full_template_tree(project_name: str) -> dict:
+            """
+            One recursive Cypher query to fetch the full project template tree
+            (project → phases → packages → tasks) and build a nested dict.
+            """
+            query = """
+            MATCH path = (p:WorkTemplate {name: $project_name})-[:HAS_CHILD*1..3]->(n:WorkTemplate)
+            WITH n,
+                 length(path) AS depth,
+                 [rel IN relationships(path) | startNode(rel).name] AS ancestors
+            RETURN n.name AS name,
+                   n.description AS description,
+                   depth,
+                   ancestors
+            ORDER BY depth
+            """
+            records = self.graph.query(query, {"project_name": project_name})
+
+            # Build nested dict: phases → packages → tasks
+            phases: Dict[str, Dict[str, list]] = {}  # phase -> {package -> [task, ...]}
+
+            for rec in records:
+                name = rec["name"]
+                desc = rec.get("description")
+                depth = rec["depth"]
+                ancestors = rec[
+                    "ancestors"
+                ]  # e.g. [project, phase] or [project, phase, package]
+
+                if depth == 1:
+                    # Phase level
+                    phases[name] = {}
+                elif depth == 2:
+                    # Package level — parent is the phase (ancestors[-1])
+                    phase_name = ancestors[-1]
+                    if phase_name in phases:
+                        phases[phase_name][name] = []
+                elif depth == 3:
+                    # Task level — grandparent is phase, parent is package
+                    phase_name = ancestors[-2] if len(ancestors) >= 2 else None
+                    package_name = ancestors[-1]
+                    if (
+                        phase_name
+                        and phase_name in phases
+                        and package_name in phases[phase_name]
+                    ):
+                        phases[phase_name][package_name].append(
+                            {"name": name, "description": desc}
+                        )
+
+            # Convert to JSON-friendly format
+            template = {
+                "project_name": project_name,
+                "phases": [
+                    {
+                        "name": phase,
+                        "packages": [
+                            {
+                                "name": pkg,
+                                "tasks": tasks,
+                            }
+                            for pkg, tasks in packages.items()
+                        ],
+                    }
+                    for phase, packages in phases.items()
+                ],
+            }
+            return template
+
+        def _fetch_required_task_and_task_details(
+            task_list: list,
+        ) -> list[dict]:
+            """
+            Fetch task details from Neo4j and extract required task_duration formula variables.
+
+            Returns:
+                - task_records: list of dicts with keys from the Neo4j 't' node
+            """
+            query = """
+            MATCH (:WorkTemplate)-[:HAS_CHILD]->(t:WorkTemplate)
+            WHERE t.name IN $task_names
+            RETURN t
             """
 
-        phase_agent = create_agent(
-            system_prompt=PHASE_AGENT_SYSTEM_PROMPT,
-            tools=phase_tools,
-            model=self.llm,
-        )
+            records = self.graph.query(query, {"task_names": task_list})
+
+            # Extract the 't' node properties from each record
+            task_records = [rec["t"] for rec in records if "t" in rec]
+
+            required_variables: dict[str, list[str]] = {}
+
+            for t in task_records:
+                task_duration = t.get("task_duration", "")
+                task_name = t.get("name", "")
+                # Extract variable placeholders like {volume}, {area}
+                # Exclude {productivity} since it comes from the record itself
+                variables = re.findall(r"\{(\w+)\}", str(task_duration))
+                for var in variables:
+                    if var != "productivity":
+                        if var not in required_variables:
+                            required_variables[var] = []
+                        required_variables[var].append(task_name)
+
+            print(f"  Fetched {len(task_records)} task details from Neo4j")
+            print(f"  Required variables: {required_variables}")
+
+            return task_records
+
+        def _calculate_task_durations(
+            task_records: list[dict],
+            per_task_values: dict[str, dict[str, float]],
+        ) -> list[dict]:
+            """
+            Calculate duration_days for each task by evaluating its formula
+            with per-task variable values and the task's own productivity.
+
+            Args:
+                task_records: list of task dicts from Neo4j
+                per_task_values: dict mapping task_name -> {variable_name: value}
+
+            Returns a list of task dicts with computed duration_days.
+            """
+            computed_tasks = []
+
+            for t in task_records:
+                task_name = t.get("name", "")
+                task_duration = t.get("task_duration", "")
+                productivity = t.get("productivity", 1)
+                unit = t.get("unit", "")
+                optional = t.get("optional", False)
+
+                # Get this task's specific variable values
+                task_vars = per_task_values.get(task_name, {})
+                # Add productivity from the Neo4j record
+                eval_context = {**task_vars, "productivity": float(productivity)}
+
+                try:
+                    # Replace {var} placeholders with actual values for eval
+                    expression = task_duration
+                    for var_name, var_value in eval_context.items():
+                        expression = expression.replace(
+                            f"{{{var_name}}}", str(var_value)
+                        )
+
+                    # Evaluate the arithmetic expression safely
+                    duration = eval(expression)  # e.g. "1000.0/80.0" -> 12.5
+                    duration_days = math.ceil(duration)
+                    print(
+                        f"  {task_name}: {task_duration} -> {expression} = {duration:.2f} -> {duration_days} days"
+                    )
+                except Exception as e:
+                    print(f"  ⚠️ Failed to calculate duration for {task_name}: {e}")
+                    duration_days = 1  # Fallback
+
+                computed_tasks.append(
+                    {
+                        "name": task_name,
+                        "duration_days": duration_days,
+                        "unit": unit,
+                        "productivity": productivity,
+                        "task_duration": task_duration,
+                        "optional": optional,
+                        "dependencies": [],
+                        "resources": [],
+                    }
+                )
+
+            # ── Resolve dependencies from knowledge graph ──
+            task_names = [t["name"] for t in computed_tasks]
+            try:
+                dependency_map = _resolve_task_dependencies(task_names)
+                for task in computed_tasks:
+                    deps = dependency_map.get(task["name"], [])
+                    task["dependencies"] = deps
+                    if deps:
+                        print(
+                            f"  📎 {task['name']} depends on: "
+                            + ", ".join(f"{d[0]} ({d[1]}, lag={d[2]})" for d in deps)
+                        )
+            except Exception as e:
+                print(f"  ⚠️ Dependency resolution failed: {e}")
+                # Tasks will keep their empty dependencies — scheduler
+                # still works (just no inter-task constraints)
+
+            return computed_tasks
+
+        def _fetch_task_dependencies(
+            task_names: list[str],
+        ) -> dict[str, list]:
+            """
+            Query direct PRECEDES relationships between tasks that are
+            both present in the user's task list.
+
+            Returns:
+                dict mapping successor_name -> list of
+                [predecessor_name, rel_type, lag]
+            """
+            query = """
+            MATCH (a:WorkTemplate)-[r:PRECEDES]->(b:WorkTemplate)
+            WHERE a.name IN $task_names AND b.name IN $task_names
+            RETURN a.name AS predecessor, b.name AS successor,
+                   r.type AS rel_type, r.lag AS lag
+            """
+            records = self.graph.query(query, {"task_names": task_names})
+
+            dep_map: dict[str, list] = {}
+            for rec in records:
+                successor = rec["successor"]
+                pred = rec["predecessor"]
+                rel_type = rec.get("rel_type", "FS") or "FS"
+                lag = int(rec.get("lag", 0) or 0)
+                dep_map.setdefault(successor, []).append([pred, rel_type, lag])
+
+            print(
+                f"  Found {sum(len(v) for v in dep_map.values())} direct "
+                f"PRECEDES relationships among {len(task_names)} tasks"
+            )
+            return dep_map
+
+        def _resolve_missing_dependencies(
+            task_names: list[str],
+            direct_dep_map: dict[str, list],
+        ) -> dict[str, list]:
+            """
+            For tasks whose graph predecessors are NOT in task_names,
+            traverse backward through PRECEDES chains to find the
+            nearest ancestor that IS in the user's task list.
+
+            Uses an LLM call when multiple candidates exist at the
+            same hop distance.
+
+            Returns:
+                dict mapping successor_name -> list of
+                [predecessor_name, rel_type, lag]  (resolved entries only)
+            """
+            # 1. Find tasks that have a PRECEDES predecessor in the graph
+            #    but that predecessor is NOT in our task list.
+            query_missing = """
+            MATCH (a:WorkTemplate)-[r:PRECEDES]->(b:WorkTemplate)
+            WHERE b.name IN $task_names AND NOT a.name IN $task_names
+            RETURN b.name AS successor, a.name AS missing_pred,
+                   r.type AS rel_type, r.lag AS lag
+            """
+            records = self.graph.query(query_missing, {"task_names": task_names})
+
+            if not records:
+                return {}
+
+            # Collect which successors have missing predecessors
+            missing_successors = set()
+            for rec in records:
+                # Only treat as "missing" if the successor doesn't
+                # already have a direct (present) predecessor
+                successor = rec["successor"]
+                if successor not in direct_dep_map:
+                    missing_successors.add(successor)
+
+            if not missing_successors:
+                return {}
+
+            print(
+                f"  🔍 {len(missing_successors)} task(s) have predecessors "
+                f"not in the current list — traversing graph..."
+            )
+
+            # 2. For each missing-predecessor task, traverse backward
+            resolved: dict[str, list] = {}
+            task_names_set = set(task_names)
+
+            for successor in missing_successors:
+                query_traverse = """
+                MATCH path = (ancestor:WorkTemplate)
+                              -[:PRECEDES*1..5]->
+                              (target:WorkTemplate {name: $task_name})
+                WHERE ancestor.name IN $task_names
+                RETURN ancestor.name AS found_predecessor,
+                       length(path)   AS hops,
+                       [r IN relationships(path) |
+                           {type: r.type, lag: r.lag}] AS chain
+                ORDER BY hops ASC
+                """
+                candidates = self.graph.query(
+                    query_traverse,
+                    {
+                        "task_name": successor,
+                        "task_names": task_names,
+                    },
+                )
+
+                if not candidates:
+                    print(
+                        f"    ⚠️ No reachable predecessor found for "
+                        f"'{successor}' within 5 hops"
+                    )
+                    continue
+
+                # Take the shortest-hop candidates
+                min_hops = candidates[0]["hops"]
+                best = [c for c in candidates if c["hops"] == min_hops]
+
+                if len(best) == 1:
+                    # Unambiguous — use the chain's first relationship
+                    # type and cumulative lag
+                    chain = best[0]["chain"]
+                    rel_type = chain[-1].get("type", "FS") or "FS"
+                    total_lag = sum(int(link.get("lag", 0) or 0) for link in chain)
+                    resolved.setdefault(successor, []).append(
+                        [best[0]["found_predecessor"], rel_type, total_lag]
+                    )
+                    print(
+                        f"    ✔ '{successor}' → resolved to "
+                        f"'{best[0]['found_predecessor']}' "
+                        f"({rel_type}, lag={total_lag}, "
+                        f"{min_hops} hop(s))"
+                    )
+                else:
+                    # Ambiguous — ask LLM to choose
+                    selected = _llm_select_dependency(successor, best)
+                    resolved.setdefault(successor, []).append(
+                        [
+                            selected.predecessor,
+                            selected.relationship_type,
+                            selected.lag,
+                        ]
+                    )
+                    print(
+                        f"    🤖 '{successor}' → LLM selected "
+                        f"'{selected.predecessor}' "
+                        f"({selected.relationship_type}, "
+                        f"lag={selected.lag}) — "
+                        f"{selected.reasoning}"
+                    )
+
+            return resolved
+
+        def _llm_select_dependency(
+            task_name: str,
+            candidates: list[dict],
+        ) -> SelectedDependency:
+            """
+            Use the LLM to select the best predecessor when graph
+            traversal finds multiple candidates at the same distance.
+            """
+            candidate_descriptions = []
+            for c in candidates:
+                chain = c["chain"]
+                rel_type = chain[-1].get("type", "FS") or "FS"
+                total_lag = sum(int(link.get("lag", 0) or 0) for link in chain)
+                candidate_descriptions.append(
+                    f"- {c['found_predecessor']} "
+                    f"(relationship: {rel_type}, "
+                    f"cumulative lag: {total_lag} days, "
+                    f"hops: {c['hops']})"
+                )
+
+            prompt = HumanMessage(
+                content=f"""You are a construction scheduling expert.
+
+                The task "{task_name}" needs a predecessor dependency, but its
+                immediate predecessor was removed from the schedule.
+
+                After traversing the knowledge graph, the following candidate
+                predecessors were found at the same distance:
+
+                {chr(10).join(candidate_descriptions)}
+
+                Select the BEST predecessor for "{task_name}" based on
+                construction sequencing logic. Consider which activity must
+                logically complete (or start) before "{task_name}" can proceed.
+
+                Return your selection with the relationship type and lag."""
+            )
+
+            structured_llm = self.llm.with_structured_output(SelectedDependency)
+            result: SelectedDependency = structured_llm.invoke([prompt])  # type: ignore
+            return result
+
+        def _resolve_task_dependencies(
+            task_names: list[str],
+        ) -> dict[str, list]:
+            """
+            Master function: fetch direct dependencies, then resolve
+            any missing predecessors via graph traversal + LLM.
+
+            Returns:
+                dict mapping task_name -> list of
+                [predecessor, rel_type, lag]
+            """
+            # Step 1: Direct dependencies (both tasks present)
+            direct = _fetch_task_dependencies(task_names)
+
+            # Step 2: Resolve missing predecessors
+            resolved = _resolve_missing_dependencies(task_names, direct)
+
+            # Merge resolved into direct
+            for successor, deps in resolved.items():
+                direct.setdefault(successor, []).extend(deps)
+
+            return direct
+
+        def _adapt_wbs_with_llm(template: dict, user_intent) -> FullProjectWBS:
+            """
+            Single LLM call: given a reference template tree + user intent,
+            produce an adapted FullProjectWBS.
+            """
+            adapt_msg = HumanMessage(
+                content=f"""You are a construction WBS expert.
+
+            Here is a reference Work Breakdown Structure (WBS) template from a similar project:
+            {json.dumps(template, indent=2)}
+
+            The user's project details:
+            {json.dumps(user_intent, indent=2) if isinstance(user_intent, dict) else user_intent}
+
+            Adapt this WBS for the user's specific project:
+            - Remove phases, packages, or tasks that don't apply to this project
+            - Keep phases, packages, or tasks that are relevant
+            - You may slightly rename tasks if needed to better fit the project type
+            - Preserve the hierarchical structure: phases → packages → tasks
+            - Pay attention to any special instructions in the user's 'other_details' field (especially those addressed to 'phase_agent')
+            - Keep the project_name from the template as-is
+
+            Return the adapted WBS."""
+            )
+
+            structured_llm = self.llm.with_structured_output(FullProjectWBS)
+            result = structured_llm.invoke([adapt_msg])
+            return result  # type: ignore
+
+        def _format_wbs_for_display(wbs_data: dict) -> str:
+            """Format a WBS dict (from FullProjectWBS.model_dump()) for user display."""
+            lines = [f"📋 Proposed WBS (based on: {wbs_data['project_name']}):"]
+            for phase in wbs_data["phases"]:
+                lines.append(f"\n  📌 {phase['name']}")
+                for pkg in phase.get("packages", []):
+                    lines.append(f"    📦 {pkg['name']}")
+                    for task in pkg.get("tasks", []):
+                        desc = (
+                            f" — {task['description']}"
+                            if task.get("description")
+                            else ""
+                        )
+                        lines.append(f"      • {task['name']}{desc}")
+            return "\n".join(lines)
 
         def phase_node(state: AgentState) -> AgentState | Command:
 
             print("\n===== PHASE NODE =====\n")
 
             interrupted = state["interrupt"]
-            
-            
+
             if not interrupted:
-                # Normal flow - invoke the agent
+
                 sender = state["sender"]
 
                 if sender == "intent_agent":
                     user_intent = state["user_intent"]
 
-                    # Extract phase_agent-specific instructions from other_details
-                    phase_instructions = ""
-                    if isinstance(user_intent, dict):
-                        other_details = user_intent.get("other_details") or {}
-                        if "phase_agent" in other_details:
-                            phase_instructions = f"\n\n**User's specific instructions:** {other_details['phase_agent']}"
-
-                    initial_msg = HumanMessage(
-                        content=f"List the major phases in construction of {user_intent}{phase_instructions}"
+                    # ── Step 1: Pick the most similar project (1 LLM call) ──
+                    print("Retrieving similar projects...")
+                    query1 = (
+                        """MATCH (p:WorkTemplate {level: "Project"}) RETURN p.name"""
                     )
-                    result = phase_agent.invoke({"messages": initial_msg})  # type: ignore
-                else:
-                    result = phase_agent.invoke(state)  # type: ignore
+                    projects = self.graph.query(query1)
 
-                messages = result["messages"]
-                last_message = messages[-1]
+                    similar_project_msg = HumanMessage(
+                        content=f"Select the most similar project from {projects} that matches {user_intent}"
+                    )
+                    structured_llm = self.llm.with_structured_output(SelectedProject)
+                    result = structured_llm.invoke([similar_project_msg])  # type: ignore
+                    similar_project = result.project  # type: ignore
+                    print(f"  Selected template: {similar_project}")
 
-                # Check if the agent called confirm_phases tool
-                phases_tool_calls = extract_toolcall(messages, "confirm_phases")
+                    # ── Step 2: Fetch full template tree (1 Cypher query) ──
+                    print("Fetching full template tree...")
+                    template = _fetch_full_template_tree(similar_project)
+                    print(f"  Template has {len(template['phases'])} phases")
 
-                if phases_tool_calls:
-                    tool_data = phases_tool_calls[-1]
-                    tool_call = tool_data["tool_call"]
-                    phases_list = tool_call["args"]["phases_list"]
-                    phases = [p.strip() for p in phases_list.split(",")]
+                    # ── Step 3: Adapt with LLM (1 LLM call) ──
+                    print("Adapting WBS for user's project...")
+                    adapted_wbs = _adapt_wbs_with_llm(template, user_intent)
+                    wbs_data = adapted_wbs.model_dump()
+                    print(f"  Adapted WBS has {len(wbs_data['phases'])} phases")
 
-                    if hasattr(last_message, "content") and last_message.content:
-                        print(f"\n🤖 Assistant: {last_message.content}")
-
-                    # Store phases in cache, set interrupt, loop back
+                    # Store adapted WBS in cache and interrupt for user confirmation
                     return Command(
-                        update=AgentState(
-                            {
-                                **state,
-                                "sender": "phase_agent",
-                                "messages": [],
-                                "cache": {
-                                    "phases_data": phases,
-                                },
-                                "interrupt": True,
-                            }
-                        ),
+                        update={
+                            "sender": "phase_agent",
+                            "messages": [],
+                            "cache": {"wbs_data": wbs_data},
+                            "interrupt": True,
+                        },
                         goto="phase_agent",
                     )
 
                 else:
-                    # No tool call yet - agent is still asking questions
-                    if hasattr(last_message, "content") and last_message.content:
-                        print(f"\n🤖 Assistant: {last_message.content}")
+                    # Correction re-entry: user gave feedback, we re-adapt
+                    # The last HumanMessage contains the correction request
+                    # and the previous WBS is in cache
+                    state_cache = state.get("cache") or {}
+                    prev_wbs = state_cache.get("wbs_data")
+                    user_intent = state["user_intent"]
 
-                    return AgentState(
-                        {**state, "sender": "phase_agent", "messages": [last_message]}
-                    )
+                    if prev_wbs:
+                        # Get the latest user message (correction)
+                        last_user_msg = ""
+                        for msg in reversed(state["messages"]):
+                            if isinstance(msg, HumanMessage):
+                                last_user_msg = msg.content
+                                break
+
+                        correction_msg = HumanMessage(
+                            content=f"""You are a construction WBS expert.
+
+                            Here is the current Work Breakdown Structure (WBS) that was proposed:
+                            {json.dumps(prev_wbs, indent=2)}
+
+                            The user's project details:
+                            {json.dumps(user_intent, indent=2) if isinstance(user_intent, dict) else user_intent}
+
+                            The user wants the following changes:
+                            "{last_user_msg}"
+
+                            Apply the requested changes and return the COMPLETE updated WBS.
+                            Preserve the hierarchical structure: phases → packages → tasks."""
+                        )
+
+                        structured_llm = self.llm.with_structured_output(FullProjectWBS)
+                        result = structured_llm.invoke([correction_msg])
+                        wbs_data = result.model_dump()  # type: ignore
+
+                        return Command(
+                            update={
+                                "sender": "phase_agent",
+                                "messages": [],
+                                "cache": {"wbs_data": wbs_data},
+                                "interrupt": True,
+                            },
+                            goto="phase_agent",
+                        )
+                    else:
+                        # No previous WBS — shouldn't happen, but fallback
+                        return {"messages": [], "interrupt": False, "cache": {}}  # type: ignore
 
             else:
-                # Interrupted — show phases and ask for confirmation
+                # ── Interrupted: show adapted WBS and ask for confirmation ──
                 state_cache = state["cache"]
 
-                if state_cache and "phases_data" in state_cache:
-                    phases = state_cache["phases_data"]
+                if state_cache and "wbs_data" in state_cache:
+                    wbs_data = state_cache["wbs_data"]
+
+                    display_text = _format_wbs_for_display(wbs_data)
 
                     user_response = interrupt(
-                        f"📋 Proposed Phases:\n{chr(10).join([f'  • {p}' for p in phases])}\n\n"
+                        f"{display_text}\n\n"
                         "Please confirm:\n"
                         "• Type 'yes' or 'confirm' to proceed\n"
                         "• Type corrections if something needs to be changed\n"
@@ -577,21 +1184,22 @@ class AgenticSchedulerModel:
 
                     if user_response_lower in ["yes", "confirm"]:
                         # ✅ User confirmed — proceed to details agent
-                        print(f"✓ Phases confirmed by user")
+                        print("✓ WBS confirmed by user")
+
+                        # Extract phase names for backward compatibility
+                        phase_names = [p["name"] for p in wbs_data["phases"]]
 
                         return Command(
-                            update=AgentState(
-                                {
-                                    **state,
-                                    "messages": [],
-                                    "sender": "phase_agent",
-                                    "current_stage": WorkflowStage.DETAILS.value,
-                                    "phases": phases,
-                                    "current_phase_index": 0,
-                                    "cache": {},
-                                    "interrupt": False,
-                                }
-                            ),
+                            update={
+                                "messages": [],
+                                "sender": "phase_agent",
+                                "current_stage": WorkflowStage.DETAILS.value,
+                                "phases": phase_names,
+                                "project_wbs": wbs_data,
+                                "current_phase_index": 0,
+                                "cache": {},
+                                "interrupt": False,
+                            },
                             goto="details_agent",
                         )
 
@@ -604,46 +1212,41 @@ class AgenticSchedulerModel:
                         )
 
                         return Command(
-                            update=AgentState(
-                                {
-                                    **state,
-                                    "messages": [restart_msg],
-                                    "sender": "user",
-                                    "current_stage": WorkflowStage.PHASES.value,
-                                    "phases": [],
-                                    "current_phase_index": None,
-                                    "interrupt": False,
-                                    "cache": {},
-                                }
-                            ),
+                            update={
+                                "messages": [restart_msg],
+                                "sender": "user",
+                                "current_stage": WorkflowStage.PHASES.value,
+                                "phases": [],
+                                "project_wbs": None,
+                                "current_phase_index": None,
+                                "interrupt": False,
+                                "cache": {},
+                            },
                             goto=END,
                         )
 
                     else:
-                        # ✏️ User wants corrections — feed feedback back to phase agent
+                        # ✏️ User wants corrections — re-adapt via LLM
                         print(f"User requested corrections: {user_response_lower}")
 
                         correction_msg = HumanMessage(
-                            content=f"Please update the phases based on this feedback: {user_response}"
+                            content=f"Please update the WBS based on this feedback: {user_response}"
                         )
 
                         return Command(
-                            update=AgentState(
-                                {
-                                    **state,
-                                    "messages": [correction_msg],
-                                    "sender": "user",
-                                    "current_stage": WorkflowStage.PHASES.value,
-                                    "interrupt": False,
-                                    "cache": {},
-                                }
-                            ),
+                            update={
+                                "messages": [correction_msg],
+                                "sender": "user",
+                                "current_stage": WorkflowStage.PHASES.value,
+                                "interrupt": False,
+                                "cache": {
+                                    "wbs_data": wbs_data
+                                },  # Keep previous WBS for correction
+                            },
                             goto="phase_agent",
                         )
                 else:
-                    return AgentState(
-                        {**state, "messages": [], "interrupt": False, "cache": {}}
-                    )
+                    return {"messages": [], "interrupt": False, "cache": {}}  # type: ignore
 
         # Create Details Agent
         DETAIL_AGENT_SYSTEM_PROMPT = """
@@ -666,9 +1269,9 @@ class AgenticSchedulerModel:
             phases = state["phases"]
             user_intent = state["user_intent"]
             generated_tasks = state.get("generated_tasks") or {}
+            state_cache = state["cache"]
 
             if not interrupted:
-                # ── Normal flow: generate tasks for the current phase ──
 
                 # Check if all phases are complete
                 if current_phase_idx is None or current_phase_idx >= len(phases):
@@ -681,83 +1284,202 @@ class AgenticSchedulerModel:
                         }
                     )
 
-                current_phase = phases[current_phase_idx]
-                print(
-                    f"Processing phase {current_phase_idx + 1}/{len(phases)}: {current_phase}"
-                )
+                if state_cache and "sub_tasks" in state_cache:
+                    current_phase = phases[current_phase_idx]
+                    task = state_cache["sub_tasks"]
 
-                # Step 1: Query KG for known tasks in this phase
-                kg_query = f"What are the tasks for {current_phase} phase?"
-                try:
-                    kg_result = self.cypher_chain.invoke({"query": kg_query})
-                    kg_tasks = kg_result.get("result", "No template found")
-                    print(f"KG Tasks: {kg_tasks}")
-                except Exception as e:
-                    print(f"KG query failed: {e}")
-                    kg_tasks = "No template available"
+                    # Extract just the name strings for the Cypher query
+                    task_names = [t["name"] if isinstance(t, dict) else t for t in task]
 
-                # Step 2: Use RAG for additional context
-                try:
-                    rag_result = self.chain.invoke(
-                        {
-                            "input": f"What are the typical tasks for {current_phase} phase in construction?"
-                        }
+                    # Fetch task details and required variables from Neo4j
+                    task_records = _fetch_required_task_and_task_details(task_names)
+
+                    # Build task summary for the LLM to generate smart questions
+                    task_summary_lines = []
+                    for t in task_records:
+                        task_duration = t.get("task_duration", "")
+                        variables = re.findall(r"\{(\w+)\}", str(task_duration))
+                        non_prod_vars = [v for v in variables if v != "productivity"]
+                        if non_prod_vars:
+                            task_summary_lines.append(
+                                f"- {t['name']}: task_duration='{task_duration}', "
+                                f"needs values for: {', '.join(non_prod_vars)}, "
+                                f"productivity={t.get('productivity')}, "
+                                f"unit={t.get('unit')}"
+                            )
+
+                    # LLM call 1: Generate context-aware questions
+                    question_prompt = HumanMessage(
+                        content=f"""
+                                The following tasks in the "{current_phase}" phase need measurements from the user to calculate their durations:
+
+                                {chr(10).join(task_summary_lines)}
+
+                                IMPORTANT: The same variable name (e.g., 'volume') can mean DIFFERENT things for different tasks.
+                                For example:
+                                - 'volume' for Excavation = volume of earth to excavate
+                                - 'volume' for RC Footing Concrete = volume of concrete to pour
+
+                                But:
+                                - 'number of foundation' in formwork, reinforcement and others are the same
+
+                                Generate a clear, numbered list of questions asking the user for each required measurement.
+                                - Be specific about WHAT is being measured for EACH task
+                                - Include the unit expected (m³, m², etc.) based on the task's unit field
+                                - Group truly identical values together (e.g., if the same floor area applies to multiple finishes)
+                                - **TRY TO GROUP THE REQUIRED VALUES AS MUCH AS POSSIBLE**
+                                - Keep it concise and construction-professional
+                                - If you GROUP together then do not ask them as seperate question, make it to a single question
+
+                                Return ONLY the numbered questions, nothing else."""  # noqa: E501
                     )
-                    rag_context = rag_result.get("answer", "")
-                    print(f"RAG Context: {rag_context}")
-                except Exception as e:
-                    print(f"RAG query failed: {e}")
-                    rag_context = ""
 
-                # Step 3: LLM generates detailed tasks USING KG as foundation
-                prompt = f"""
-                Generate detailed tasks for the "{current_phase}" phase of a construction project.
+                    llm_questions = self.llm.invoke([question_prompt])
+                    question_text = llm_questions.content
+                    question_text = f"  LLM generated questions:\n{question_text}"
 
-                KNOWN TASKS FROM DATABASE (use these as foundation):
-                {kg_tasks}
+                    return Command(
+                        update=AgentState(
+                            {
+                                **state,
+                                "sender": "details_agent",
+                                "messages": [],
+                                "cache": {
+                                    "awaiting_variables": True,
+                                    "task_records": task_records,
+                                    "current_phase": current_phase,
+                                    "question_text": question_text,
+                                    "task_summary_lines": task_summary_lines,
+                                },
+                                "interrupt": True,
+                            }
+                        ),
+                        goto="details_agent",
+                    )
 
-                ADDITIONAL CONTEXT:
-                {rag_context}
+                else:
+                    current_phase = phases[current_phase_idx]
 
-                PROJECT DETAILS: {user_intent}
+                    print(
+                        f"Processing phase {current_phase_idx + 1}/{len(phases)}: {current_phase}"
+                    )
 
-                Return a structured list of tasks with:
-                - name: task name
-                - duration_days: estimated duration
-                - dependencies: list of [previous_task, relationship_type, lag_days]
-                - resources: list of [resource_name, amount]
-                """
+                    # ── Read tasks from the adapted WBS (set by phase_node) ──
+                    project_wbs = state.get("project_wbs") or {}
+                    wbs_tasks_for_phase: list[dict] = []
 
-                try:
-                    result = self.llm.with_structured_output(TaskList).invoke(prompt)
-                    phase_tasks = [task.model_dump() for task in result.tasks]  # type: ignore
-                    print(f"Generated {len(phase_tasks)} tasks for {current_phase}")
-                except Exception as e:
-                    print(f"Task generation failed: {e}")
-                    phase_tasks = []
+                    for wbs_phase in project_wbs.get("phases", []):
+                        if wbs_phase["name"] == current_phase:
+                            for pkg in wbs_phase.get("packages", []):
+                                for task in pkg.get("tasks", []):
+                                    wbs_tasks_for_phase.append(task)
+                            break
 
-                # Store in cache and interrupt for user review
-                return Command(
-                    update=AgentState(
-                        {
-                            **state,
-                            "sender": "details_agent",
-                            "messages": [],
-                            "cache": {
-                                "pending_tasks": phase_tasks,
-                                "current_phase": current_phase,
-                            },
-                            "interrupt": True,
-                        }
-                    ),
-                    goto="details_agent",
-                )
+                    if wbs_tasks_for_phase:
+                        task_names_str = ", ".join(
+                            t["name"] for t in wbs_tasks_for_phase
+                        )
+                        print(f"  WBS tasks for {current_phase}: {task_names_str}")
+                    else:
+                        print(
+                            f"  No WBS tasks found for {current_phase}, LLM will generate from scratch"
+                        )
+
+                    #         Use the reference tasks as a starting point. For each task, provide:
+                    #         - name: task name
+                    #         - duration_days: estimated duration in days
+                    #         - dependencies: list of [previous_task, relationship_type, lag_days]
+                    #         - resources: list of [resource_name, amount]
+                    #         """
+
+                    # Store in cache and interrupt for user review
+                    return Command(
+                        update=AgentState(
+                            {
+                                **state,
+                                "sender": "details_agent",
+                                "messages": [],
+                                "cache": {
+                                    "sub_tasks": wbs_tasks_for_phase,
+                                    "current_phase": current_phase,
+                                },
+                                "interrupt": False,
+                            }
+                        ),
+                        goto="details_agent",
+                    )
 
             else:
-                # ── Interrupted: present tasks for user review ──
-                state_cache = state["cache"]
 
-                if state_cache and "pending_tasks" in state_cache:
+                if state_cache and state_cache.get("awaiting_variables"):
+                    # ── LLM-powered variable collection ──
+                    task_records = state_cache["task_records"]
+                    phase_name = state_cache["current_phase"]
+                    question_text = state_cache["question_text"]
+                    task_summary_lines = state_cache["task_summary_lines"]
+
+                    # Interrupt user with the LLM-generated questions
+                    user_response = interrupt(
+                        f'📐 To calculate task durations for "{phase_name}":\n\n'
+                        f"{question_text}"
+                    )
+                    print(f"  → User response: '{user_response}'")
+
+                    # LLM call 2: Parse user's free-text response into per-task values
+                    parse_prompt = HumanMessage(
+                        content=f"""You are a construction data parser.
+
+                                Here are the tasks and the variables each one needs:
+                                {chr(10).join(task_summary_lines)}
+
+                                Here are the questions that were asked:
+                                {question_text}
+
+                                Here is the user's response:
+                                "{user_response}"
+
+                                Extract the numeric values for EACH task's variables from the user's response.
+                                Each task needs its OWN variable values — do NOT share values between tasks unless the user explicitly says they are the same.
+                                Use the exact task names as listed above."""  # noqa: E501
+                    )
+
+                    structured_llm = self.llm.with_structured_output(TaskVariableValues)
+                    parsed_values: TaskVariableValues = structured_llm.invoke([parse_prompt])  # type: ignore
+
+                    # Convert to per_task_values dict
+                    per_task_values: dict[str, dict[str, float]] = {}
+                    for tv in parsed_values.task_values:
+                        per_task_values[tv.task_name] = {
+                            entry.variable_name: entry.value
+                            for entry in tv.variable_entries
+                        }
+
+                    print(f"  Parsed per-task values: {per_task_values}")
+
+                    # Calculate durations using per-task values
+                    print("  Calculating durations with per-task values...")
+                    computed_tasks = _calculate_task_durations(
+                        task_records, per_task_values
+                    )
+
+                    # Move to pending_tasks confirmation
+                    return Command(
+                        update=AgentState(
+                            {
+                                **state,
+                                "sender": "details_agent",
+                                "messages": [],
+                                "cache": {
+                                    "pending_tasks": computed_tasks,
+                                    "current_phase": phase_name,
+                                },
+                                "interrupt": True,
+                            }
+                        ),
+                        goto="details_agent",
+                    )
+
+                elif state_cache and "pending_tasks" in state_cache:
                     pending_tasks = state_cache["pending_tasks"]
                     phase_name = state_cache["current_phase"]
 
@@ -774,7 +1496,7 @@ class AgenticSchedulerModel:
 
                     user_response = interrupt(
                         f'📋 Generated Tasks for "{phase_name}" '
-                        f"(Phase {current_phase_idx + 1}/{len(phases)}):\n" # type: ignore
+                        f"(Phase {current_phase_idx + 1}/{len(phases)}):\n"  # type: ignore
                         f"{task_list_str}\n\n"
                         "Please review:\n"
                         "• Type 'yes' or 'confirm' to accept and move to the next phase\n"
@@ -804,7 +1526,7 @@ class AgenticSchedulerModel:
                                     "messages": [response_msg],
                                     "sender": "details_agent",
                                     "current_stage": WorkflowStage.DETAILS.value,
-                                    "current_phase_index": current_phase_idx + 1, # type: ignore
+                                    "current_phase_index": current_phase_idx + 1,  # type: ignore
                                     "generated_tasks": generated_tasks,
                                     "interrupt": False,
                                     "cache": {},
@@ -882,10 +1604,6 @@ class AgenticSchedulerModel:
                     return AgentState(
                         {**state, "messages": [], "interrupt": False, "cache": {}}
                     )
-
-            return AgentState(
-                {**state, "messages": [], "interrupt": False, "cache": {}}
-            )
 
         def scheduling_node(state: AgentState) -> AgentState | Command:
             print("\n===== SCHEDULING NODE =====\n")
@@ -1036,7 +1754,8 @@ class AgenticSchedulerModel:
         def intent_exit_router(state: AgentState):
             return (
                 "phase_agent"
-                if state["current_stage"] == WorkflowStage.PHASES.value
+                if state.get("current_stage", WorkflowStage.INTENT.value)
+                == WorkflowStage.PHASES.value
                 else END
             )
 
@@ -1070,83 +1789,6 @@ class AgenticSchedulerModel:
                         if isinstance(item, dict) and "value" in item:
                             return item["value"]
         return None
-
-    # def chat_with_model(self):
-    #     print("🚀 AI Assistant Started!")
-    #     print("-" * 60)
-
-    #     # Create a thread ID
-    #     thread_id = str(uuid.uuid4())
-    #     config = RunnableConfig(
-    #         configurable={"thread_id": thread_id}, recursion_limit=50
-    #     )
-
-    #     print(f"Thread ID: {thread_id}")
-
-    #     # START with initial state ONLY ONCE
-    #     initial_state: AgentState = {
-    #         "messages": [HumanMessage(content="", config=config)],
-    #         "sender": "user",
-    #         "current_stage": WorkflowStage.INTENT.value,  # Start from INTENT
-    #         "phases": [],
-    #         "user_intent": None,
-    #         "current_phase_index": None,
-    #         "generated_tasks": {},
-    #     }
-
-    #     # Initial invoke with empty state
-    #     self.workflow.invoke(initial_state, config=config)
-
-    #     while True:
-    #         input_from_interrupt = False
-    #         user_input = None
-    #         try:
-    #             # Check for interrupts FIRST
-    #             state_snapshot = self.workflow.get_state(config)
-
-    #             if state_snapshot.tasks:
-    #                 for task in state_snapshot.tasks:
-    #                     if hasattr(task, "interrupts") and task.interrupts:
-    #                         for item in task.interrupts:
-    #                             print(f"\n🤖 Assistant: {item.value}")
-
-    #                             # Get user response to interrupt
-    #                             input_from_interrupt = True
-    #                             user_input = input("\n👤 You: ").strip()
-
-    #                             # Resume with JUST the response
-    #                             self.workflow.invoke(
-    #                                 Command(resume=user_input), config=config
-    #                             )
-    #                             continue
-
-    #             # No interrupt? Get normal user input
-    #             if not input_from_interrupt:
-    #                 user_input = input("\n👤 You: ").strip()
-    #                 input_from_interrupt = False
-
-    #             if user_input and user_input.lower() in ["exit", "quit", "bye"]:
-    #                 print("👋 Goodbye!")
-    #                 break
-
-    #             # Send ONLY the new message, not full state
-    #             self.workflow.invoke(
-    #                 {"messages": [HumanMessage(content=user_input)]},  # type: ignore
-    #                 config=config,
-    #             )
-
-    #         except KeyboardInterrupt:
-    #             print("\n👋 Goodbye!")
-    #             break
-
-    #         except Exception as e:
-    #             print(f"❌ Error: {e}")
-    #             import traceback
-
-    #             traceback.print_exc()
-    #             break
-
-    #     print("👋 Goodbye!")
 
     def _visualize_graph(self):
         """Visualize the graph and save as PNG"""

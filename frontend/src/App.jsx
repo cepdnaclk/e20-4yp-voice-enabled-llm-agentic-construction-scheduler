@@ -9,6 +9,7 @@ import { startChat, sendMessage, resumeChat } from './api';
 function App() {
   const [threadId, setThreadId] = useState(null);
   const [messages, setMessages] = useState([]);
+  const [hasStarted, setHasStarted] = useState(false);
   const [currentStage, setCurrentStage] = useState('intent');
   const [phases, setPhases] = useState([]);
   const [generatedTasks, setGeneratedTasks] = useState({});
@@ -28,13 +29,6 @@ function App() {
       setIsInitializing(true);
       const data = await startChat();
       setThreadId(data.thread_id);
-
-      if (data.message) {
-        setMessages([{ role: 'ai', content: data.message }]);
-      }
-      if (data.interrupt) {
-        setPendingInterrupt(data.interrupt);
-      }
       if (data.stage) {
         setCurrentStage(data.stage);
       }
@@ -107,6 +101,7 @@ function App() {
 
     // Add user message
     setMessages(prev => [...prev, { role: 'user', content: text }]);
+    setHasStarted(true);
     setIsLoading(true);
     streamingMessageRef.current = '';
 
@@ -151,6 +146,7 @@ function App() {
             isInitializing={isInitializing}
             pendingInterrupt={pendingInterrupt}
             currentStage={currentStage}
+            hasStarted={hasStarted}
           />
         </div>
 

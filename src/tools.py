@@ -59,24 +59,11 @@ def submit_construction_intent(
 
 
 #### Phases Tools ####
+# Phase node uses direct structured output (Option B), no tool-calling agent needed.
 
-
-@tool
-def confirm_phases(phases_list: str) -> list:
-    """
-    Call this tool once you have identified the major construction phases for the project.
-    Input should be a comma-separated list of phases (e.g., "Foundation, Framing, Roofing").
-    """
-    # Parse the list
-    phases = [p.strip() for p in phases_list.split(",")]
-    if not phases:
-        return []
-
-    return phases
+phase_tools = []  # Kept for backward compatibility with create_agent imports
 
 
 intent_tools = [submit_construction_intent]
-
-phase_tools = [confirm_phases]
 
 details_tools = []
