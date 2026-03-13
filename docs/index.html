@@ -163,6 +163,11 @@
       background-clip: text;
       margin-bottom: 20px;
     }
+    [data-theme="light"] .hero-title {
+      background: linear-gradient(135deg, #1e3a8a 20%, var(--accent) 100%);
+      -webkit-background-clip: text;
+      background-clip: text;
+    }
     .hero-sub {
       font-size: 1.1rem;
       color: var(--text-muted);
@@ -170,6 +175,7 @@
       margin: 0 auto 40px;
       line-height: 1.75;
     }
+    [data-theme="light"] .hero-sub { color: #334155; }
     .hero-tags {
       display: flex;
       flex-wrap: wrap;
@@ -186,6 +192,14 @@
       color: #c4b5fd;
       font-weight: 500;
     }
+    [data-theme="light"] .hero-tag {
+      background: rgba(37,99,235,0.1);
+      border-color: rgba(37,99,235,0.3);
+      color: #1d4ed8;
+    }
+    [data-theme="light"] .hero-badge { color: var(--primary); background: rgba(37,99,235,0.1); border-color: rgba(37,99,235,0.3); }
+    [data-theme="light"] .btn-hero-ghost { border-color: rgba(15,23,42,0.25); color: #1e293b; }
+    [data-theme="light"] .btn-hero-ghost:hover { background: rgba(15,23,42,0.06); color: #0f172a; }
     .btn-hero-primary {
       background: linear-gradient(135deg, var(--primary), var(--primary-dark));
       border: none;
@@ -446,7 +460,7 @@
     }
     .supervisor-card:hover { border-color: rgba(6,182,212,0.4); }
     .supervisor-avatar {
-      width: 50px; height: 50px;
+      width: 56px; height: 56px;
       border-radius: 50%;
       background: linear-gradient(135deg, var(--accent), var(--accent2));
       display: flex; align-items: center; justify-content: center;
@@ -454,6 +468,15 @@
       font-weight: 700;
       color: white;
       flex-shrink: 0;
+    }
+    .supervisor-photo {
+      width: 56px; height: 56px;
+      border-radius: 50%;
+      object-fit: cover;
+      object-position: top;
+      flex-shrink: 0;
+      border: 2px solid rgba(59,130,246,0.35);
+      box-shadow: 0 0 0 3px rgba(59,130,246,0.1);
     }
     .supervisor-name { font-size: 0.95rem; font-weight: 600; }
     .supervisor-role { font-size: 0.8rem; color: var(--text-muted); }
@@ -975,7 +998,7 @@
       <div class="row g-3 justify-content-center">
         <div class="col-md-4">
           <div class="supervisor-card">
-            <div class="supervisor-avatar" style="background: linear-gradient(135deg, #3b82f6, #06b6d4);">IS</div>
+            <img src="./images/isuru-nawinne.png" alt="Dr. Isuru Nawinne" class="supervisor-photo" />
             <div>
               <div class="supervisor-name">Dr. Isuru Nawinne</div>
               <div class="supervisor-role">Department of Computer Engineering</div>
@@ -986,7 +1009,7 @@
         </div>
         <div class="col-md-4">
           <div class="supervisor-card">
-            <div class="supervisor-avatar" style="background: linear-gradient(135deg, #8b5cf6, #ec4899);">UP</div>
+            <img src="./images/upul-jayasinghe.jpg" alt="Dr. Upul Jayasinghe" class="supervisor-photo" />
             <div>
               <div class="supervisor-name">Dr. Upul Jayasinghe</div>
               <div class="supervisor-role">Department of Computer Engineering</div>
@@ -997,7 +1020,7 @@
         </div>
         <div class="col-md-4">
           <div class="supervisor-card">
-            <div class="supervisor-avatar" style="background: linear-gradient(135deg, #10b981, #06b6d4);">DA</div>
+            <img src="./images/damayanthi-herath.jpg" alt="Dr. Damayanthi Herath" class="supervisor-photo" />
             <div>
               <div class="supervisor-name">Dr. Damayanthi Herath</div>
               <div class="supervisor-role">Department of Computer Engineering</div>              
@@ -1006,9 +1029,9 @@
             </div>
           </div>
         </div>
-        <div class="col-md-4">
+        <div class="col-md-6">
           <div class="supervisor-card">
-            <div class="supervisor-avatar" style="background: linear-gradient(135deg, #f59e0b, #ef4444);">RU</div>
+            <img src="./images/ruwini-edirisinghe.jpeg" alt="Dr. Ruwini Edirisinghe" class="supervisor-photo" />
             <div>
               <div class="supervisor-name">Dr. Ruwini Edirisinghe</div>
               <div class="supervisor-role">School of Property, Construction and Project Management</div>
@@ -1017,7 +1040,7 @@
             </div>
           </div>
         </div>
-        <div class="col-md-4">
+        <div class="col-md-6">
           <div class="supervisor-card">
             <div class="supervisor-avatar" style="background: linear-gradient(135deg, #06b6d4, #8b5cf6);">FR</div>
             <div>
