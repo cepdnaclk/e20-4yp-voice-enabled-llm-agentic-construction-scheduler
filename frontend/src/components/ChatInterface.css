@@ -181,6 +181,62 @@
     cursor: not-allowed;
 }
 
+/* ── Mic / Voice Button ───────────────────────────────────── */
+.mic-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 46px;
+    height: 46px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.2s ease;
+    flex-shrink: 0;
+    position: relative;
+}
+
+.mic-btn:hover:not(:disabled) {
+    background: rgba(102, 126, 234, 0.12);
+    border-color: var(--accent-blue);
+    color: var(--accent-blue);
+    transform: scale(1.05);
+}
+
+.mic-btn:active:not(:disabled) {
+    transform: scale(0.95);
+}
+
+.mic-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+/* Active / listening state */
+.mic-btn.listening {
+    background: rgba(239, 68, 68, 0.12);
+    border-color: #ef4444;
+    color: #ef4444;
+}
+
+/* Pulsing ring animation while recording */
+.mic-btn.listening::before {
+    content: '';
+    position: absolute;
+    inset: -4px;
+    border-radius: calc(var(--radius-md) + 4px);
+    border: 2px solid #ef4444;
+    animation: mic-pulse 1.4s ease-out infinite;
+    pointer-events: none;
+}
+
+@keyframes mic-pulse {
+    0%   { opacity: 0.8; transform: scale(1); }
+    100% { opacity: 0;   transform: scale(1.55); }
+}
+
 .input-hint {
     display: flex;
     align-items: center;
