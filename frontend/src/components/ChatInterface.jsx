@@ -6,7 +6,7 @@ import './ChatInterface.css';
 function ChatInterface({ messages, onSend, isLoading, isInitializing, pendingInterrupt, currentStage, hasStarted }) {
     const messagesEndRef = useRef(null);
     const inputRef = useRef(null);
-    const { isListening, isSupported, toggleListening } = useVoiceInput(inputRef);
+    const { isListening, isSupported, toggleListening } = useVoiceInput(inputRef, onSend);
 
     // Auto-scroll to bottom
     useEffect(() => {

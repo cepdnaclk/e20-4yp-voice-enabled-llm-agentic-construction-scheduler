@@ -1,101 +1,127 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 
 /**
- * useVoiceInput — React hook that wraps the Web Speech API.
+ * useVoiceInput — React hook wrapping the Web Speech API.
  *
- * @param {React.RefObject} inputRef - ref to the textarea to inject transcripts into
- * @returns {{ isListening, isSupported, toggleListening }}
+ * Real-time transcription: interim results appear in the textarea as you speak.
+ * Auto-submit: fires only when the user explicitly clicks the mic button to stop
+ *             (NOT on browser-initiated pauses), so half-sentences are never sent.
+ *
+ * Works across ALL agent stages — intent, phase, details, scheduling —
+ * because transcribed text goes through the same onSend() path as typed text.
+ *
+ * @param {React.RefObject} inputRef     - ref to the <textarea>
+ * @param {Function}        onAutoSubmit - optional: called with final text on explicit stop
  */
-function useVoiceInput(inputRef) {
+function useVoiceInput(inputRef, onAutoSubmit = null) {
     const [isListening, setIsListening] = useState(false);
-    const recognitionRef = useRef(null);
+    const recognitionRef  = useRef(null);
+    const finalRef        = useRef('');          // accumulates confirmed words
+    const userStoppedRef  = useRef(false);       // true when USER clicked stop (not browser)
+    const autoSubmitRef   = useRef(onAutoSubmit);
 
-    // Check browser support (Chrome/Edge: webkitSpeechRecognition, newer spec: SpeechRecognition)
+    // Keep the callback ref fresh without destroying the recognition instance
+    useEffect(() => {
+        autoSubmitRef.current = onAutoSubmit;
+    }, [onAutoSubmit]);
+
     const SpeechRecognition =
         window.SpeechRecognition || window.webkitSpeechRecognition;
     const isSupported = Boolean(SpeechRecognition);
 
-    // Build the recognition instance once
+    // ── Write text directly into the uncontrolled textarea ────────────────────
+    const writeToTextarea = (text) => {
+        const el = inputRef.current;
+        if (!el) return;
+
+        // Direct DOM write — works for uncontrolled <textarea>
+        el.value = text;
+
+        // Dispatch 'input' so the auto-resize onInput handler in ChatInterface fires
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+
+        // Manual resize fallback
+        el.style.height = 'auto';
+        el.style.height = Math.min(el.scrollHeight, 150) + 'px';
+    };
+
+    // ── Build the recognition instance once ───────────────────────────────────
     useEffect(() => {
         if (!isSupported) return;
 
         const recognition = new SpeechRecognition();
-        recognition.continuous = true;       // keep listening until explicitly stopped
-        recognition.interimResults = true;   // show partial results as user speaks
-        recognition.lang = 'en-US';
-
-        let finalTranscript = '';
+        recognition.continuous     = true;   // keep going until explicitly stopped
+        recognition.interimResults = true;   // fire onresult with partial words in real time
+        recognition.lang           = 'en-US';
 
         recognition.onstart = () => {
             setIsListening(true);
-            finalTranscript = ''; // reset accumulator on each session
+            finalRef.current       = '';
+            userStoppedRef.current = false;
         };
 
+        // ── This fires for EVERY word (interim) and confirmed sentence (final) ──
         recognition.onresult = (event) => {
             let interim = '';
+
             for (let i = event.resultIndex; i < event.results.length; i++) {
                 const transcript = event.results[i][0].transcript;
                 if (event.results[i].isFinal) {
-                    finalTranscript += transcript + ' ';
+                    finalRef.current += transcript + ' ';
                 } else {
-                    interim = transcript;
+                    interim = transcript;          // live word-by-word preview
                 }
             }
 
-            if (inputRef.current) {
-                // Combine finalised words + live interim text
-                inputRef.current.value = finalTranscript + interim;
-
-                // Trigger React's synthetic onChange so the component knows the value changed
-                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                    window.HTMLTextAreaElement.prototype,
-                    'value'
-                ).set;
-                nativeInputValueSetter.call(inputRef.current, inputRef.current.value);
-                inputRef.current.dispatchEvent(new Event('input', { bubbles: true }));
-
-                // Auto-resize the textarea
-                inputRef.current.style.height = 'auto';
-                inputRef.current.style.height =
-                    Math.min(inputRef.current.scrollHeight, 150) + 'px';
-            }
+            // Show confirmed words + current in-progress word
+            writeToTextarea(finalRef.current + interim);
         };
 
         recognition.onerror = (event) => {
-            console.warn('SpeechRecognition error:', event.error);
+            if (event.error !== 'no-speech' && event.error !== 'aborted') {
+                console.warn('SpeechRecognition error:', event.error);
+            }
             setIsListening(false);
         };
 
         recognition.onend = () => {
             setIsListening(false);
+
+            const text = finalRef.current.trim();
+
+            // Auto-submit ONLY if the USER clicked stop (not a browser-initiated end)
+            if (userStoppedRef.current && autoSubmitRef.current && text) {
+                userStoppedRef.current = false;
+                // Small delay so the textarea shows final text before it's cleared
+                setTimeout(() => {
+                    autoSubmitRef.current(text);
+                    writeToTextarea('');
+                    finalRef.current = '';
+                }, 100);
+            }
         };
 
         recognitionRef.current = recognition;
 
-        return () => {
-            recognition.abort();
-        };
+        return () => { recognition.abort(); };
     }, [isSupported]); // eslint-disable-line react-hooks/exhaustive-deps
 
+    // ── Toggle: start or stop recording ───────────────────────────────────────
     const toggleListening = useCallback(() => {
-        if (!recognitionRef.current) return;
+        const rec = recognitionRef.current;
+        if (!rec) return;
 
         if (isListening) {
-            recognitionRef.current.stop();
+            userStoppedRef.current = true;   // mark as user-initiated stop
+            rec.stop();
         } else {
-            // Clear old text so each recording session starts fresh (optional UX choice)
-            // Remove the two lines below if you want to APPEND to existing text instead
-            if (inputRef.current) {
-                inputRef.current.value = '';
-                inputRef.current.style.height = 'auto';
-            }
-            try {
-                recognitionRef.current.start();
-            } catch (err) {
-                // Ignore "already started" errors
-            }
+            // Clear textarea for a fresh recording session
+            writeToTextarea('');
+            finalRef.current = '';
+            userStoppedRef.current = false;
+            try { rec.start(); } catch { /* already started */ }
         }
-    }, [isListening, inputRef]);
+    }, [isListening]); // eslint-disable-line react-hooks/exhaustive-deps
 
     return { isListening, isSupported, toggleListening };
 }
