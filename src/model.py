@@ -21,7 +21,7 @@ from pydantic import SecretStr
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.runnables import RunnableConfig
-from langchain.agents import create_agent
+from langgraph.prebuilt import create_react_agent
 from src.tools import setup_tools, phase_tools, details_tools, intent_tools
 from langchain_neo4j import Neo4jGraph
 from langchain_community.vectorstores import Neo4jVector
@@ -31,6 +31,20 @@ from langchain_classic.chains.retrieval import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
 from src.scheduler import solve_schedule
+
+
+class _CompatAgent:
+    def __init__(self, runnable):
+        self._runnable = runnable
+
+    def invoke(self, state):
+        messages = state.get("messages", []) if isinstance(state, dict) else state
+        return self._runnable.invoke({"messages": messages})
+
+
+def create_agent(*, system_prompt, tools, model, response_format=None):
+    runnable = create_react_agent(model=model, tools=tools, prompt=system_prompt)
+    return _CompatAgent(runnable)
 
 # load the env variables from the .env file
 load_dotenv(".env")
