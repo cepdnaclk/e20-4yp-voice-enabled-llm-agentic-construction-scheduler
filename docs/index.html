@@ -1,0 +1,1137 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Voice-Enabled LLM Agentic Construction Scheduler</title>
+  <meta name="description" content="An LLM-based agentic system for automating construction scheduling using voice input, powered by LangGraph multi-agent architecture and Neo4j knowledge graphs." />
+
+  <!-- Bootstrap -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" />
+  <!-- Remix Icons -->
+  <link href="https://cdn.jsdelivr.net/npm/remixicon@4.2.0/fonts/remixicon.css" rel="stylesheet" />
+  <!-- Google Fonts -->
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+
+  <style>
+    :root,
+    [data-theme="dark"] {
+      --primary:      #3b82f6;
+      --primary-dark: #2563eb;
+      --accent:       #06b6d4;
+      --accent2:      #8b5cf6;
+      --bg:           #050d1a;
+      --bg2:          #0a1628;
+      --bg3:          #0f1f3d;
+      --card-bg:      rgba(15, 31, 61, 0.8);
+      --border:       rgba(59, 130, 246, 0.2);
+      --text:         #e2e8f0;
+      --text-muted:   #94a3b8;
+      --glow:         0 0 40px rgba(59, 130, 246, 0.25);
+      --nav-bg:       rgba(5, 13, 26, 0.92);
+      --hero-overlay: linear-gradient(160deg, rgba(5,13,26,0.92) 0%, rgba(10,22,54,0.85) 100%);
+    }
+
+    [data-theme="light"] {
+      --primary:      #2563eb;
+      --primary-dark: #1d4ed8;
+      --accent:       #0891b2;
+      --accent2:      #7c3aed;
+      --bg:           #f0f4ff;
+      --bg2:          #e8eeff;
+      --bg3:          #dce6ff;
+      --card-bg:      rgba(255, 255, 255, 0.9);
+      --border:       rgba(37, 99, 235, 0.18);
+      --text:         #0f172a;
+      --text-muted:   #475569;
+      --glow:         0 0 40px rgba(37, 99, 235, 0.15);
+      --nav-bg:       rgba(240, 244, 255, 0.95);
+      --hero-overlay: linear-gradient(160deg, rgba(240,244,255,0.88) 0%, rgba(219,234,254,0.82) 100%);
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      scroll-behavior: smooth;
+    }
+
+    /* ── Scrollbar ── */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: var(--bg2); }
+    ::-webkit-scrollbar-thumb { background: var(--primary); border-radius: 3px; }
+
+    /* ── Transitions ── */
+    body, .navbar, .glass-card, .agent-card, .team-card, .supervisor-card,
+    .tech-item, .link-card, .pipeline-step, section, footer {
+      transition: background 0.3s ease, color 0.3s ease, border-color 0.3s ease;
+    }
+
+    /* ── Navbar ── */
+    .navbar {
+      background: var(--nav-bg) !important;
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+      padding: 14px 0;
+    }
+    .navbar-brand {
+      font-weight: 700;
+      font-size: 1rem;
+      color: var(--text) !important;
+      letter-spacing: -0.3px;
+    }
+    .navbar-brand .brand-icon {
+      background: linear-gradient(135deg, var(--primary), var(--accent));
+      border-radius: 8px;
+      padding: 6px 10px;
+      font-size: 1.3rem;
+      margin-right: 10px;
+    }
+
+    /* ── Theme Toggle Button ── */
+    #theme-toggle {
+      background: rgba(255,255,255,0.08);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 6px 12px;
+      font-size: 1rem;
+      cursor: pointer;
+      color: var(--text);
+      transition: all 0.2s;
+      line-height: 1;
+    }
+    #theme-toggle:hover { background: rgba(59,130,246,0.15); border-color: var(--primary); }
+    [data-theme="light"] #theme-toggle { background: rgba(37,99,235,0.08); }
+    .nav-link {
+      color: var(--text-muted) !important;
+      font-size: 0.88rem;
+      font-weight: 500;
+      padding: 6px 14px !important;
+      border-radius: 6px;
+      transition: all 0.2s;
+    }
+    .nav-link:hover { color: var(--primary) !important; background: rgba(59,130,246,0.08); }
+    .navbar-toggler { border-color: var(--border); }
+    .navbar-toggler-icon { filter: invert(1); }
+
+    /* ── HERO ── */
+    #hero {
+      min-height: 100vh;
+      background:
+        var(--hero-overlay),
+        url('./images/hero_banner.png') center/cover no-repeat;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      padding: 120px 20px 80px;
+      position: relative;
+      overflow: hidden;
+    }
+    #hero::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: radial-gradient(ellipse at 50% 60%, rgba(59,130,246,0.12) 0%, transparent 70%);
+      pointer-events: none;
+    }
+    .hero-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(59,130,246,0.12);
+      border: 1px solid rgba(59,130,246,0.35);
+      border-radius: 50px;
+      padding: 6px 18px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--accent);
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      margin-bottom: 24px;
+    }
+    .hero-title {
+      font-size: clamp(2rem, 5vw, 3.8rem);
+      font-weight: 800;
+      line-height: 1.1;
+      letter-spacing: -1px;
+      background: linear-gradient(135deg, #fff 30%, var(--accent) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      margin-bottom: 20px;
+    }
+    .hero-sub {
+      font-size: 1.1rem;
+      color: var(--text-muted);
+      max-width: 700px;
+      margin: 0 auto 40px;
+      line-height: 1.75;
+    }
+    .hero-tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: center;
+      margin-bottom: 40px;
+    }
+    .hero-tag {
+      background: rgba(139,92,246,0.12);
+      border: 1px solid rgba(139,92,246,0.3);
+      border-radius: 50px;
+      padding: 5px 14px;
+      font-size: 0.8rem;
+      color: #c4b5fd;
+      font-weight: 500;
+    }
+    .btn-hero-primary {
+      background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+      border: none;
+      border-radius: 10px;
+      padding: 13px 28px;
+      font-weight: 600;
+      font-size: 0.95rem;
+      color: white;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      box-shadow: 0 4px 24px rgba(59,130,246,0.35);
+      transition: all 0.25s;
+    }
+    .btn-hero-primary:hover { transform: translateY(-2px); box-shadow: 0 8px 32px rgba(59,130,246,0.5); color: white; }
+    .btn-hero-ghost {
+      background: transparent;
+      border: 1px solid rgba(255,255,255,0.18);
+      border-radius: 10px;
+      padding: 13px 28px;
+      font-weight: 600;
+      font-size: 0.95rem;
+      color: var(--text);
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      transition: all 0.25s;
+    }
+    .btn-hero-ghost:hover { background: rgba(255,255,255,0.06); border-color: rgba(255,255,255,0.4); color: white; }
+
+    /* ── SECTIONS ── */
+    .section-pad { padding: 90px 0; }
+    .section-border { border-top: 1px solid var(--border); }
+
+    .section-label {
+      display: inline-block;
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--accent);
+      background: rgba(6,182,212,0.1);
+      border: 1px solid rgba(6,182,212,0.25);
+      border-radius: 50px;
+      padding: 4px 14px;
+      margin-bottom: 14px;
+    }
+    .section-title {
+      font-size: clamp(1.6rem, 3vw, 2.4rem);
+      font-weight: 800;
+      letter-spacing: -0.5px;
+      margin-bottom: 14px;
+    }
+    .section-desc { color: var(--text-muted); font-size: 1rem; line-height: 1.75; max-width: 700px; }
+    .line-bar {
+      width: 60px; height: 4px;
+      background: linear-gradient(90deg, var(--primary), var(--accent));
+      border-radius: 2px;
+      margin: 16px auto 30px;
+    }
+
+    /* ── CARDS ── */
+    .glass-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 28px;
+      transition: all 0.3s;
+      height: 100%;
+    }
+    .glass-card:hover {
+      border-color: rgba(59,130,246,0.45);
+      transform: translateY(-4px);
+      box-shadow: var(--glow);
+    }
+    .card-icon {
+      width: 52px; height: 52px;
+      background: linear-gradient(135deg, rgba(59,130,246,0.2), rgba(6,182,212,0.15));
+      border: 1px solid rgba(59,130,246,0.3);
+      border-radius: 12px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 1.4rem;
+      margin-bottom: 18px;
+      flex-shrink: 0;
+    }
+    .card-icon.purple {
+      background: linear-gradient(135deg, rgba(139,92,246,0.2), rgba(168,85,247,0.15));
+      border-color: rgba(139,92,246,0.3);
+    }
+    .card-title { font-size: 1rem; font-weight: 700; margin-bottom: 8px; }
+    .card-text { color: var(--text-muted); font-size: 0.88rem; line-height: 1.65; }
+
+    /* ── WORKFLOW PIPELINE ── */
+    .pipeline {
+      display: flex;
+      align-items: stretch;
+      gap: 0;
+      flex-wrap: nowrap;
+      overflow-x: auto;
+      padding: 10px 0 20px;
+    }
+    .pipeline-step {
+      flex: 1;
+      min-width: 160px;
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 22px 18px;
+      text-align: center;
+      position: relative;
+    }
+    .pipeline-step:not(:last-child)::after {
+      content: '→';
+      position: absolute;
+      right: -18px;
+      top: 50%;
+      transform: translateY(-50%);
+      font-size: 1.3rem;
+      color: var(--accent);
+      z-index: 1;
+    }
+    .pipeline-step + .pipeline-step { margin-left: 26px; }
+    .pipeline-num {
+      width: 30px; height: 30px;
+      background: linear-gradient(135deg, var(--primary), var(--accent));
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 0.75rem;
+      font-weight: 700;
+      margin: 0 auto 12px;
+    }
+    .pipeline-icon { font-size: 1.5rem; margin-bottom: 10px; display: block; }
+    .pipeline-label { font-size: 0.82rem; font-weight: 600; color: var(--text); margin-bottom: 6px; }
+    .pipeline-desc { font-size: 0.75rem; color: var(--text-muted); line-height: 1.5; }
+
+    /* ── AGENT CARDS ── */
+    .agent-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 24px;
+      transition: all 0.3s;
+    }
+    .agent-card:hover { border-color: rgba(139,92,246,0.5); box-shadow: 0 0 30px rgba(139,92,246,0.15); }
+    .agent-badge {
+      display: inline-block;
+      padding: 3px 10px;
+      border-radius: 50px;
+      font-size: 0.7rem;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      margin-bottom: 14px;
+    }
+    .badge-blue { background: rgba(59,130,246,0.15); color: #93c5fd; border: 1px solid rgba(59,130,246,0.3); }
+    .badge-purple { background: rgba(139,92,246,0.15); color: #c4b5fd; border: 1px solid rgba(139,92,246,0.3); }
+    .badge-cyan { background: rgba(6,182,212,0.15); color: #67e8f9; border: 1px solid rgba(6,182,212,0.3); }
+    .badge-green { background: rgba(16,185,129,0.15); color: #6ee7b7; border: 1px solid rgba(16,185,129,0.3); }
+    .agent-name { font-size: 1rem; font-weight: 700; margin-bottom: 8px; }
+    .agent-desc { font-size: 0.85rem; color: var(--text-muted); line-height: 1.6; margin-bottom: 14px; }
+    .agent-tools { display: flex; flex-wrap: wrap; gap: 6px; }
+    .tool-pill {
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 6px;
+      padding: 3px 9px;
+      font-size: 0.72rem;
+      font-family: 'JetBrains Mono', monospace;
+      color: var(--text-muted);
+    }
+
+    /* ── TECH STACK ── */
+    .tech-item {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px 20px;
+      transition: all 0.25s;
+    }
+    .tech-item:hover { border-color: rgba(59,130,246,0.4); }
+    .tech-icon { font-size: 1.6rem; flex-shrink: 0; }
+    .tech-name { font-size: 0.9rem; font-weight: 700; }
+    .tech-role { font-size: 0.78rem; color: var(--text-muted); }
+
+    /* ── FEATURES LIST ── */
+    .feature-list li {
+      padding: 10px 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text-muted);
+      font-size: 0.9rem;
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+    }
+    .feature-list li:last-child { border-bottom: none; }
+    .feature-list li i { color: var(--accent); font-size: 1.1rem; margin-top: 1px; flex-shrink: 0; }
+
+    /* ── TEAM ── */
+    .team-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 32px 24px 24px;
+      text-align: center;
+      transition: all 0.3s;
+    }
+    .team-card:hover { border-color: rgba(59,130,246,0.4); transform: translateY(-5px); box-shadow: var(--glow); }
+    .team-photo {
+      width: 90px; height: 90px;
+      border-radius: 50%;
+      object-fit: cover;
+      margin: 0 auto 16px;
+      display: block;
+      border: 3px solid rgba(59,130,246,0.35);
+      box-shadow: 0 0 0 4px rgba(59,130,246,0.1);
+    }
+    .team-avatar {
+      width: 90px; height: 90px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--primary), var(--accent2));
+      display: flex; align-items: center; justify-content: center;
+      font-size: 2rem;
+      font-weight: 800;
+      color: white;
+      margin: 0 auto 16px;
+      border: 3px solid rgba(59,130,246,0.3);
+    }
+    .team-name { font-size: 1rem; font-weight: 700; }
+    .team-id { font-size: 0.8rem; color: var(--accent); font-family: 'JetBrains Mono', monospace; margin-bottom: 14px; }
+    .team-socials { display: flex; justify-content: center; gap: 10px; }
+    .team-socials a {
+      width: 34px; height: 34px;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      color: var(--text-muted);
+      font-size: 1rem;
+      text-decoration: none;
+      transition: all 0.2s;
+    }
+    .team-socials a:hover { background: rgba(59,130,246,0.15); border-color: var(--primary); color: var(--primary); }
+
+    /* ── SUPERVISOR CARD ── */
+    .supervisor-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px 24px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      transition: all 0.25s;
+    }
+    .supervisor-card:hover { border-color: rgba(6,182,212,0.4); }
+    .supervisor-avatar {
+      width: 50px; height: 50px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      display: flex; align-items: center; justify-content: center;
+      font-size: 1.2rem;
+      font-weight: 700;
+      color: white;
+      flex-shrink: 0;
+    }
+    .supervisor-name { font-size: 0.95rem; font-weight: 600; }
+    .supervisor-role { font-size: 0.8rem; color: var(--text-muted); }
+
+    /* ── LINKS ── */
+    .link-card {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 18px 22px;
+      text-decoration: none;
+      color: var(--text);
+      transition: all 0.25s;
+    }
+    .link-card:hover { border-color: rgba(59,130,246,0.45); transform: translateX(4px); box-shadow: var(--glow); color: var(--text); }
+    .link-card i { font-size: 1.5rem; color: var(--accent); flex-shrink: 0; }
+    .link-card-title { font-size: 0.9rem; font-weight: 600; }
+    .link-card-url { font-size: 0.75rem; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; }
+    .link-card .arrow { margin-left: auto; color: var(--text-muted); font-size: 1.1rem; }
+
+    /* ── FOOTER ── */
+    footer {
+      padding: 40px 0 24px;
+      border-top: 1px solid var(--border);
+      background: var(--bg2);
+      text-align: center;
+    }
+    footer p { color: var(--text-muted); font-size: 0.85rem; }
+    footer img { height: 36px; margin-bottom: 16px; filter: brightness(0) invert(1) opacity(0.4); }
+
+    /* ── MISC ── */
+    .highlight-box {
+      background: rgba(59,130,246,0.06);
+      border: 1px solid rgba(59,130,246,0.2);
+      border-left: 4px solid var(--primary);
+      border-radius: 0 10px 10px 0;
+      padding: 16px 20px;
+      font-size: 0.9rem;
+      color: var(--text-muted);
+      line-height: 1.7;
+    }
+    .mono-tag {
+      font-family: 'JetBrains Mono', monospace;
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 4px;
+      padding: 2px 6px;
+      font-size: 0.8rem;
+      color: var(--accent);
+    }
+
+    @media (max-width: 768px) {
+      .pipeline { flex-direction: column; }
+      .pipeline-step:not(:last-child)::after { content: '↓'; right: 50%; top: unset; bottom: -22px; transform: translateX(50%); }
+      .pipeline-step + .pipeline-step { margin-left: 0; margin-top: 30px; }
+    }
+  </style>
+</head>
+
+<body data-bs-spy="scroll" data-bs-target=".navbar" data-bs-offset="80">
+
+  <!-- ════════════════════ NAVBAR ════════════════════ -->
+  <nav class="navbar navbar-expand-lg sticky-top">
+    <div class="container">
+      <a class="navbar-brand d-flex align-items-center" href="#">
+        <span class="brand-icon">🏗️</span>
+        <span>VoiceScheduler</span>
+      </a>
+      <button class="navbar-toggler" type="button" data-bs-toggle="collapse"
+        data-bs-target="#navbarNav" aria-label="Toggle navigation">
+        <span class="navbar-toggler-icon"></span>
+      </button>
+      <div class="collapse navbar-collapse" id="navbarNav">
+        <ul class="navbar-nav ms-auto gap-1">
+          <li class="nav-item"><a class="nav-link" href="#hero">Home</a></li>
+          <li class="nav-item"><a class="nav-link" href="#abstract">Abstract</a></li>
+          <li class="nav-item"><a class="nav-link" href="#architecture">Architecture</a></li>
+          <li class="nav-item"><a class="nav-link" href="#agents">Agents</a></li>
+          <li class="nav-item"><a class="nav-link" href="#tech">Technology</a></li>
+          <li class="nav-item"><a class="nav-link" href="#team">Team</a></li>
+          <li class="nav-item"><a class="nav-link" href="#links">Links</a></li>
+          <li class="nav-item d-flex align-items-center ms-2">
+            <button id="theme-toggle" title="Toggle light/dark mode" aria-label="Toggle theme">🌙</button>
+          </li>
+        </ul>
+      </div>
+    </div>
+  </nav>
+
+  <!-- ════════════════════ HERO ════════════════════ -->
+  <section id="hero">
+    <div class="container position-relative">
+      <div class="hero-badge">
+        <i class="ri-mic-fill"></i>
+        E20 Four Year Project · 2024/2025
+      </div>
+      <h1 class="hero-title">Voice-Enabled LLM<br>Agentic Construction<br>Scheduler</h1>
+      <p class="hero-sub">
+        Speak your project requirements — our multi-agent AI system understands them, builds a Work Breakdown Structure, and generates an optimized construction schedule automatically.
+      </p>
+      <div class="hero-tags">
+        <span class="hero-tag">🤖 LangGraph Multi-Agent</span>
+        <span class="hero-tag">🧠 GPT-5-mini</span>
+        <span class="hero-tag">🗣️ Web Speech API</span>
+        <span class="hero-tag">🗃️ Neo4j Knowledge Graph</span>
+        <span class="hero-tag">⚙️ OR-Tools Scheduler</span>
+        <span class="hero-tag">🌐 FastAPI + React</span>
+      </div>
+      <div class="d-flex gap-3 justify-content-center flex-wrap">
+        <a href="https://github.com/cepdnaclk/e20-4yp-voice-enabled-llm-agentic-construction-scheduler" target="_blank" class="btn-hero-primary">
+          <i class="ri-github-fill"></i> View on GitHub
+        </a>
+        <a href="#abstract" class="btn-hero-ghost">
+          <i class="ri-arrow-down-line"></i> Learn More
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- ════════════════════ ABSTRACT ════════════════════ -->
+  <section id="abstract" class="section-pad section-border">
+    <div class="container">
+      <div class="text-center mb-5">
+        <span class="section-label">Research Overview</span>
+        <h2 class="section-title">Abstract</h2>
+        <div class="line-bar"></div>
+      </div>
+      <div class="row g-4 align-items-start">
+        <div class="col-lg-7">
+          <div class="highlight-box mb-4">
+            Construction project scheduling is a complex, time-intensive process typically requiring domain expertise and specialized software. Our research presents a novel approach: an autonomous multi-agent AI system that converts a user's natural voice description into a fully optimized construction schedule — with zero manual scheduling input.
+          </div>
+          <p style="color:var(--text-muted); line-height:1.85; font-size:0.95rem;">
+            The system leverages a <strong style="color:var(--text)">LangGraph-based multi-agent architecture</strong> where specialized AI agents collaborate through a shared state graph. Users speak their construction project requirements, which are converted to text via the <strong style="color:var(--text)">Web Speech API</strong>. An intent agent extracts structured project data, a phase agent retrieves relevant WBS templates from a <strong style="color:var(--text)">Neo4j knowledge graph</strong>, a details agent gathers task-specific parameters through an interactive dialogue, and a scheduling agent uses <strong style="color:var(--text)">Google OR-Tools</strong> to generate a constraint-satisfying, dependency-respecting schedule.
+          </p>
+          <p class="mt-3" style="color:var(--text-muted); line-height:1.85; font-size:0.95rem;">
+            The result is a Gantt chart rendered in real-time on a React dashboard, with Server-Sent Events (SSE) for live streaming of agent responses. This research aims to democratize construction project management by making AI-powered scheduling accessible through natural conversation.
+          </p>
+        </div>
+        <div class="col-lg-5">
+          <div class="row g-3">
+            <div class="col-6">
+              <div class="glass-card text-center">
+                <div style="font-size:2rem; margin-bottom:8px;">🎤</div>
+                <div style="font-size:0.8rem; font-weight:700; margin-bottom:4px;">Voice Input</div>
+                <div style="font-size:0.75rem; color:var(--text-muted);">Natural language project description</div>
+              </div>
+            </div>
+            <div class="col-6">
+              <div class="glass-card text-center">
+                <div style="font-size:2rem; margin-bottom:8px;">🤖</div>
+                <div style="font-size:0.8rem; font-weight:700; margin-bottom:4px;">4 AI Agents</div>
+                <div style="font-size:0.75rem; color:var(--text-muted);">Collaborative multi-agent workflow</div>
+              </div>
+            </div>
+            <div class="col-6">
+              <div class="glass-card text-center">
+                <div style="font-size:2rem; margin-bottom:8px;">🗃️</div>
+                <div style="font-size:0.8rem; font-weight:700; margin-bottom:4px;">Knowledge Graph</div>
+                <div style="font-size:0.75rem; color:var(--text-muted);">Neo4j WBS template library</div>
+              </div>
+            </div>
+            <div class="col-6">
+              <div class="glass-card text-center">
+                <div style="font-size:2rem; margin-bottom:8px;">📅</div>
+                <div style="font-size:0.8rem; font-weight:700; margin-bottom:4px;">Auto Schedule</div>
+                <div style="font-size:0.75rem; color:var(--text-muted);">OR-Tools optimized Gantt chart</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ════════════════════ ARCHITECTURE ════════════════════ -->
+  <section id="architecture" class="section-pad section-border">
+    <div class="container">
+      <div class="text-center mb-5">
+        <span class="section-label">System Design</span>
+        <h2 class="section-title">Solution Architecture</h2>
+        <div class="line-bar"></div>
+        <p class="section-desc mx-auto">
+          A full-stack AI pipeline from voice input to an optimized construction schedule, powered by LangGraph state machines and semantic graph retrieval.
+        </p>
+      </div>
+
+      <!-- Pipeline -->
+      <div class="pipeline mb-5">
+        <div class="pipeline-step">
+          <span class="pipeline-icon">🎤</span>
+          <div class="pipeline-num">1</div>
+          <div class="pipeline-label">Voice Input</div>
+          <div class="pipeline-desc">Web Speech API converts speech to text</div>
+        </div>
+        <div class="pipeline-step">
+          <span class="pipeline-icon">🧠</span>
+          <div class="pipeline-num">2</div>
+          <div class="pipeline-label">Intent Agent</div>
+          <div class="pipeline-desc">Extracts structured project requirements</div>
+        </div>
+        <div class="pipeline-step">
+          <span class="pipeline-icon">🗃️</span>
+          <div class="pipeline-num">3</div>
+          <div class="pipeline-label">Phase Agent</div>
+          <div class="pipeline-desc">Neo4j graph retrieval for WBS template</div>
+        </div>
+        <div class="pipeline-step">
+          <span class="pipeline-icon">📋</span>
+          <div class="pipeline-num">4</div>
+          <div class="pipeline-label">Details Agent</div>
+          <div class="pipeline-desc">Gathers task parameters interactively</div>
+        </div>
+        <div class="pipeline-step">
+          <span class="pipeline-icon">⚙️</span>
+          <div class="pipeline-num">5</div>
+          <div class="pipeline-label">Scheduler</div>
+          <div class="pipeline-desc">OR-Tools generates optimal schedule</div>
+        </div>
+        <div class="pipeline-step">
+          <span class="pipeline-icon">📊</span>
+          <div class="pipeline-num">6</div>
+          <div class="pipeline-label">Gantt Chart</div>
+          <div class="pipeline-desc">Interactive React dashboard output</div>
+        </div>
+      </div>
+
+      <!-- Architecture Points -->
+      <div class="row g-4">
+        <div class="col-md-6 col-lg-4">
+          <div class="glass-card">
+            <div class="card-icon"><i class="ri-share-circle-line" style="color:var(--primary)"></i></div>
+            <div class="card-title">LangGraph State Machine</div>
+            <div class="card-text">Agents are nodes in a directed graph with typed shared state (<span class="mono-tag">AgentState</span>). The router node dynamically directs flow between agents based on the current workflow stage.</div>
+          </div>
+        </div>
+        <div class="col-md-6 col-lg-4">
+          <div class="glass-card">
+            <div class="card-icon"><i class="ri-database-2-line" style="color:var(--accent)"></i></div>
+            <div class="card-title">Neo4j Knowledge Graph</div>
+            <div class="card-text">Work breakdown structure templates are stored as a hierarchical graph (Project → Phase → Package → Task). Cypher queries retrieve the best-matching template for the user's project type.</div>
+          </div>
+        </div>
+        <div class="col-md-6 col-lg-4">
+          <div class="glass-card">
+            <div class="card-icon"><i class="ri-cpu-line" style="color:var(--accent2)"></i></div>
+            <div class="card-title">OR-Tools Optimization</div>
+            <div class="card-text">Google's constraint programming solver handles task dependencies (FS/SS/FF/SF), resource allocation, and duration formulas to produce a globally optimal construction schedule.</div>
+          </div>
+        </div>
+        <div class="col-md-6 col-lg-4">
+          <div class="glass-card">
+            <div class="card-icon"><i class="ri-broadcast-line" style="color:#10b981"></i></div>
+            <div class="card-title">SSE Real-Time Streaming</div>
+            <div class="card-text">FastAPI endpoints stream agent responses character-by-character using Server-Sent Events, creating a real-time typewriter effect and live stage updates in the React UI.</div>
+          </div>
+        </div>
+        <div class="col-md-6 col-lg-4">
+          <div class="glass-card">
+            <div class="card-icon"><i class="ri-pause-circle-line" style="color:#f59e0b"></i></div>
+            <div class="card-title">Human-in-the-Loop</div>
+            <div class="card-text">LangGraph's <span class="mono-tag">interrupt()</span> mechanism pauses the workflow at critical points (e.g., intent confirmation, phase selection) to await user validation before proceeding.</div>
+          </div>
+        </div>
+        <div class="col-md-6 col-lg-4">
+          <div class="glass-card">
+            <div class="card-icon"><i class="ri-mic-2-line" style="color:#ef4444"></i></div>
+            <div class="card-title">Voice Interface</div>
+            <div class="card-text">Browser-native Web Speech API (no external service or API key needed) provides continuous voice recognition with real-time interim results injected directly into the chat input.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ════════════════════ AGENTS ════════════════════ -->
+  <section id="agents" class="section-pad section-border">
+    <div class="container">
+      <div class="text-center mb-5">
+        <span class="section-label">Multi-Agent System</span>
+        <h2 class="section-title">AI Agent Roles</h2>
+        <div class="line-bar"></div>
+        <p class="section-desc mx-auto">Four specialized agents collaborate through a shared LangGraph state to guide the user from voice input to a complete construction schedule.</p>
+      </div>
+      <div class="row g-4">
+        <div class="col-md-6 col-lg-3">
+          <div class="agent-card">
+            <span class="agent-badge badge-blue">STAGE 1</span>
+            <div class="agent-name">🎯 Intent Agent</div>
+            <div class="agent-desc">Conducts a natural conversation to collect project requirements. Extracts structured intent (project type, size, floors, location, timeline) and confirms with the user before proceeding.</div>
+            <div class="agent-tools">
+              <span class="tool-pill">submit_intent</span>
+              <span class="tool-pill">GPT-5-mini</span>
+              <span class="tool-pill">interrupt()</span>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-6 col-lg-3">
+          <div class="agent-card">
+            <span class="agent-badge badge-purple">STAGE 2</span>
+            <div class="agent-name">📐 Phase Agent</div>
+            <div class="agent-desc">Queries the Neo4j knowledge graph to find the most suitable WBS template. Uses Cypher QA chain to retrieve the full hierarchy of phases, work packages, and sub-tasks.</div>
+            <div class="agent-tools">
+              <span class="tool-pill">GraphCypherQA</span>
+              <span class="tool-pill">Neo4j</span>
+              <span class="tool-pill">structured_output</span>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-6 col-lg-3">
+          <div class="agent-card">
+            <span class="agent-badge badge-cyan">STAGE 3</span>
+            <div class="agent-name">📋 Details Agent</div>
+            <div class="agent-desc">Fetches task-specific parameters (productivity rates, formulas) from Neo4j and interactively queries the user for dimension variables needed to compute accurate task durations.</div>
+            <div class="agent-tools">
+              <span class="tool-pill">duration_formulas</span>
+              <span class="tool-pill">variable_extraction</span>
+              <span class="tool-pill">interrupt()</span>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-6 col-lg-3">
+          <div class="agent-card">
+            <span class="agent-badge badge-green">STAGE 4</span>
+            <div class="agent-name">⚙️ Scheduling Agent</div>
+            <div class="agent-desc">Applies OR-Tools constraint programming to generate an optimal schedule respecting all task dependencies (FS/SS/FF/SF relationships) and resource constraints from the knowledge graph.</div>
+            <div class="agent-tools">
+              <span class="tool-pill">ortools</span>
+              <span class="tool-pill">dependency_graph</span>
+              <span class="tool-pill">CP-SAT</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ════════════════════ METHODOLOGY ════════════════════ -->
+  <section id="methodology" class="section-pad section-border">
+    <div class="container">
+      <div class="text-center mb-5">
+        <span class="section-label">Research Approach</span>
+        <h2 class="section-title">Methodology</h2>
+        <div class="line-bar"></div>
+      </div>
+      <div class="row g-4">
+        <div class="col-lg-6">
+          <h5 class="mb-3" style="font-weight:700;">🔬 Knowledge Graph Construction</h5>
+          <ul class="feature-list list-unstyled">
+            <li><i class="ri-check-double-line"></i>Curated industry-standard WBS templates for residential, commercial, industrial, and infrastructure projects</li>
+            <li><i class="ri-check-double-line"></i>Task nodes contain productivity rates, duration formulas, and dependency relationship types</li>
+            <li><i class="ri-check-double-line"></i>Graph traversal retrieves full hierarchical project trees via recursive Cypher queries</li>
+            <li><i class="ri-check-double-line"></i>Dependency resolution maps FS/SS/FF/SF relationships with lag days between tasks</li>
+          </ul>
+        </div>
+        <div class="col-lg-6">
+          <h5 class="mb-3" style="font-weight:700;">🤖 LLM Integration Strategy</h5>
+          <ul class="feature-list list-unstyled">
+            <li><i class="ri-check-double-line"></i>Structured output parsing (Pydantic models) ensures reliable data extraction from LLM responses</li>
+            <li><i class="ri-check-double-line"></i>Each agent operates with a carefully designed system prompt and tool suite</li>
+            <li><i class="ri-check-double-line"></i>LangGraph's MemorySaver enables persistent conversation state across multi-turn interactions</li>
+            <li><i class="ri-check-double-line"></i>Human-in-the-loop interrupts at stage boundaries prevent erroneous autonomous progression</li>
+          </ul>
+        </div>
+        <div class="col-lg-6">
+          <h5 class="mb-3" style="font-weight:700;">📅 Scheduling Algorithm</h5>
+          <ul class="feature-list list-unstyled">
+            <li><i class="ri-check-double-line"></i>Duration formulas use project-specific dimensions (area, volume) gathered dynamically from users</li>
+            <li><i class="ri-check-double-line"></i>OR-Tools CP-SAT solver handles complex dependency networks with lag constraints</li>
+            <li><i class="ri-check-double-line"></i>Schedule output includes start/end dates, phase assignments, and critical path identification</li>
+            <li><i class="ri-check-double-line"></i>Results rendered as an interactive Gantt chart with zoom, pan, and phase color-coding</li>
+          </ul>
+        </div>
+        <div class="col-lg-6">
+          <h5 class="mb-3" style="font-weight:700;">🎤 Voice Interface Design</h5>
+          <ul class="feature-list list-unstyled">
+            <li><i class="ri-check-double-line"></i>Browser-native Web Speech API — free, no external service, powered by Google's speech engine</li>
+            <li><i class="ri-check-double-line"></i>Continuous mode with interim results for real-time feedback during dictation</li>
+            <li><i class="ri-check-double-line"></i>Graceful fallback to text input in non-supporting browsers (Firefox, Safari)</li>
+            <li><i class="ri-check-double-line"></i>Visual recording state indicator with pulsing animation to signal active microphone</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ════════════════════ TECH STACK ════════════════════ -->
+  <section id="tech" class="section-pad section-border">
+    <div class="container">
+      <div class="text-center mb-5">
+        <span class="section-label">Implementation</span>
+        <h2 class="section-title">Technology Stack</h2>
+        <div class="line-bar"></div>
+      </div>
+      <div class="row g-4">
+        <div class="col-lg-4">
+          <h6 class="mb-3" style="color:var(--accent); font-weight:700; font-size:0.8rem; letter-spacing:0.08em; text-transform:uppercase;">🧠 AI & Backend</h6>
+          <div class="d-flex flex-column gap-3">
+            <div class="tech-item">
+              <span class="tech-icon">🦜</span>
+              <div><div class="tech-name">LangGraph / LangChain</div><div class="tech-role">Multi-agent orchestration & state management</div></div>
+            </div>
+            <div class="tech-item">
+              <span class="tech-icon">🧠</span>
+              <div><div class="tech-name">OpenAI GPT-5-mini</div><div class="tech-role">Language model for all four agents</div></div>
+            </div>
+            <div class="tech-item">
+              <span class="tech-icon">⚡</span>
+              <div><div class="tech-name">FastAPI</div><div class="tech-role">REST API + SSE streaming backend</div></div>
+            </div>
+            <div class="tech-item">
+              <span class="tech-icon">⚙️</span>
+              <div><div class="tech-name">Google OR-Tools</div><div class="tech-role">Constraint programming scheduler</div></div>
+            </div>
+          </div>
+        </div>
+        <div class="col-lg-4">
+          <h6 class="mb-3" style="color:var(--accent2); font-weight:700; font-size:0.8rem; letter-spacing:0.08em; text-transform:uppercase;">🗃️ Data & Knowledge</h6>
+          <div class="d-flex flex-column gap-3">
+            <div class="tech-item">
+              <span class="tech-icon">🌿</span>
+              <div><div class="tech-name">Neo4j Graph Database</div><div class="tech-role">WBS knowledge graph & Cypher QA</div></div>
+            </div>
+            <div class="tech-item">
+              <span class="tech-icon">🔗</span>
+              <div><div class="tech-name">LangChain Neo4j</div><div class="tech-role">GraphCypherQAChain integration</div></div>
+            </div>
+            <div class="tech-item">
+              <span class="tech-icon">🛡️</span>
+              <div><div class="tech-name">Pydantic v2</div><div class="tech-role">Structured output validation & parsing</div></div>
+            </div>
+            <div class="tech-item">
+              <span class="tech-icon">📦</span>
+              <div><div class="tech-name">python-dotenv</div><div class="tech-role">Environment configuration management</div></div>
+            </div>
+          </div>
+        </div>
+        <div class="col-lg-4">
+          <h6 class="mb-3" style="color:#10b981; font-weight:700; font-size:0.8rem; letter-spacing:0.08em; text-transform:uppercase;">🌐 Frontend</h6>
+          <div class="d-flex flex-column gap-3">
+            <div class="tech-item">
+              <span class="tech-icon">⚛️</span>
+              <div><div class="tech-name">React 19 + Vite</div><div class="tech-role">Chat UI, Gantt chart, task board</div></div>
+            </div>
+            <div class="tech-item">
+              <span class="tech-icon">🎤</span>
+              <div><div class="tech-name">Web Speech API</div><div class="tech-role">Browser-native voice recognition</div></div>
+            </div>
+            <div class="tech-item">
+              <span class="tech-icon">📡</span>
+              <div><div class="tech-name">Server-Sent Events</div><div class="tech-role">Real-time agent response streaming</div></div>
+            </div>
+            <div class="tech-item">
+              <span class="tech-icon">🎨</span>
+              <div><div class="tech-name">Vanilla CSS</div><div class="tech-role">Custom dark-mode design system</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ════════════════════ TEAM ════════════════════ -->
+  <section id="team" class="section-pad section-border">
+    <div class="container">
+      <div class="text-center mb-5">
+        <span class="section-label">The People</span>
+        <h2 class="section-title">Our Team</h2>
+        <div class="line-bar"></div>
+        <p class="section-desc mx-auto">Department of Computer Engineering · Faculty of Engineering · University of Peradeniya</p>
+      </div>
+
+      <!-- Students -->
+      <h6 class="mb-4 text-center" style="color:var(--text-muted); font-size:0.8rem; letter-spacing:0.1em; text-transform:uppercase;">Students</h6>
+      <div class="row g-4 justify-content-center mb-5">
+        <div class="col-sm-6 col-lg-3">
+          <div class="team-card">
+            <img src="./images/e20009.jpg" alt="Ahemad I.I" class="team-photo" />
+            <div class="team-name">Ahemad I.I</div>
+            <div class="team-id">E/20/009</div>
+            <div class="team-socials">
+              <a href="https://www.thecn.com/IA518" target="_blank" title="CN Profile"><i class="ri-profile-fill"></i></a>
+              <a href="https://www.linkedin.com/in/imaam-ahemad/" target="_blank" title="LinkedIn"><i class="ri-linkedin-box-fill"></i></a>
+              <a href="https://github.com/Ahemad72" target="_blank" title="GitHub"><i class="ri-github-fill"></i></a>
+            </div>
+          </div>
+        </div>
+        <div class="col-sm-6 col-lg-3">
+          <div class="team-card">
+            <img src="./images/e20199.jpg" alt="Ketharagan P" class="team-photo" />
+            <div class="team-name">Ketharagan P</div>
+            <div class="team-id">E/20/199</div>
+            <div class="team-socials">
+              <a href="https://www.thecn.com/EK646" title="CN Profile"><i class="ri-profile-fill"></i></a>
+              <a href="https://www.linkedin.com/in/ketharagan-p-767b11204?lipi=urn%3Ali%3Apage%3Ad_flagship3_profile_view_base_contact_details%3BgWG7fQWRRi%2BcPUXEJOmapw%3D%3D" title="LinkedIn"><i class="ri-linkedin-box-fill"></i></a>
+              <a href="https://github.com/ketha29" title="GitHub"><i class="ri-github-fill"></i></a>
+            </div>
+          </div>
+        </div>
+        <div class="col-sm-6 col-lg-3">
+          <div class="team-card">
+            <img src="./images/339.jpg" alt="Rismy A.M" class="team-photo" />
+            <div class="team-name">Rismy A.M</div>
+            <div class="team-id">E/20/339</div>
+            <div class="team-socials">
+              <a href="https://www.thecn.com/ER732" title="CN Profile"><i class="ri-profile-fill"></i></a>
+              <a href="https://www.linkedin.com/in/mohamad-rismy-229063288" title="LinkedIn"><i class="ri-linkedin-box-fill"></i></a>
+              <a href="https://github.com/mrismy" title="GitHub"><i class="ri-github-fill"></i></a>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Supervisors -->
+      <h6 class="mb-4 text-center" style="color:var(--text-muted); font-size:0.8rem; letter-spacing:0.1em; text-transform:uppercase;">Supervisors</h6>
+      <div class="row g-3 justify-content-center">
+        <div class="col-md-4">
+          <div class="supervisor-card">
+            <div class="supervisor-avatar" style="background: linear-gradient(135deg, #3b82f6, #06b6d4);">IS</div>
+            <div>
+              <div class="supervisor-name">Dr. Isuru Nawinne</div>
+              <div class="supervisor-role">Department of Computer Engineering</div>
+              <div class="supervisor-role">University of Peradeniya</div>
+              <div class="supervisor-role">Kandy, Sri Lanka</div>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-4">
+          <div class="supervisor-card">
+            <div class="supervisor-avatar" style="background: linear-gradient(135deg, #8b5cf6, #ec4899);">UP</div>
+            <div>
+              <div class="supervisor-name">Dr. Upul Jayasinghe</div>
+              <div class="supervisor-role">Department of Computer Engineering</div>
+              <div class="supervisor-role">University of Peradeniya</div>
+              <div class="supervisor-role">Kandy, Sri Lanka</div>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-4">
+          <div class="supervisor-card">
+            <div class="supervisor-avatar" style="background: linear-gradient(135deg, #10b981, #06b6d4);">DA</div>
+            <div>
+              <div class="supervisor-name">Dr. Damayanthi Herath</div>
+              <div class="supervisor-role">Department of Computer Engineering</div>              
+              <div class="supervisor-role">University of Peradeniya</div>
+              <div class="supervisor-role">Kandy, Sri Lanka</div>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-4">
+          <div class="supervisor-card">
+            <div class="supervisor-avatar" style="background: linear-gradient(135deg, #f59e0b, #ef4444);">RU</div>
+            <div>
+              <div class="supervisor-name">Dr. Ruwini Edirisinghe</div>
+              <div class="supervisor-role">School of Property, Construction and Project Management</div>
+              <div class="supervisor-role">RMIT University</div>
+              <div class="supervisor-role">Melbourne, Australia</div>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-4">
+          <div class="supervisor-card">
+            <div class="supervisor-avatar" style="background: linear-gradient(135deg, #06b6d4, #8b5cf6);">FR</div>
+            <div>
+              <div class="supervisor-name">Dr. Frank Boukamp</div>
+              <div class="supervisor-role">School of Property, Construction and Project Management</div>
+              <div class="supervisor-role">RMIT University</div>
+              <div class="supervisor-role">Melbourne, Australia</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+
+  <!-- ════════════════════ LINKS ════════════════════ -->
+  <section id="links" class="section-pad section-border">
+    <div class="container">
+      <div class="text-center mb-5">
+        <span class="section-label">Resources</span>
+        <h2 class="section-title">Useful Links</h2>
+        <div class="line-bar"></div>
+        <p class="section-desc mx-auto">Explore the project repository, academic resources, and affiliated institutions.</p>
+      </div>
+      <div class="row g-3 justify-content-center">
+        <div class="col-md-5">
+          <a href="https://github.com/cepdnaclk/e20-4yp-voice-enabled-llm-agentic-construction-scheduler" target="_blank" class="link-card">
+            <i class="ri-github-fill"></i>
+            <div><div class="link-card-title">Project Repository</div><div class="link-card-url">github.com/cepdnaclk/e20-4yp-...</div></div>
+            <i class="ri-arrow-right-line arrow"></i>
+          </a>
+        </div>
+        <div class="col-md-5">
+          <a href="https://cepdnaclk.github.io/e20-4yp-voice-enabled-llm-agentic-construction-scheduler" target="_blank" class="link-card">
+            <i class="ri-pages-line"></i>
+            <div><div class="link-card-title">Project Page</div><div class="link-card-url">cepdnaclk.github.io/...</div></div>
+            <i class="ri-arrow-right-line arrow"></i>
+          </a>
+        </div>
+        <div class="col-md-5">
+          <a href="http://www.ce.pdn.ac.lk/" target="_blank" class="link-card">
+            <i class="ri-building-4-line"></i>
+            <div><div class="link-card-title">Department of Computer Engineering</div><div class="link-card-url">ce.pdn.ac.lk</div></div>
+            <i class="ri-arrow-right-line arrow"></i>
+          </a>
+        </div>
+        <div class="col-md-5">
+          <a href="https://eng.pdn.ac.lk/" target="_blank" class="link-card">
+            <i class="ri-school-line"></i>
+            <div><div class="link-card-title">Faculty of Engineering</div><div class="link-card-url">eng.pdn.ac.lk</div></div>
+            <i class="ri-arrow-right-line arrow"></i>
+          </a>
+        </div>
+        <div class="col-md-5">
+          <a href="https://www.pdn.ac.lk/" target="_blank" class="link-card">
+            <i class="ri-globe-line"></i>
+            <div><div class="link-card-title">University of Peradeniya</div><div class="link-card-url">pdn.ac.lk</div></div>
+            <i class="ri-arrow-right-line arrow"></i>
+          </a>
+        </div>
+        <div class="col-md-5">
+          <a href="https://projects.ce.pdn.ac.lk/" target="_blank" class="link-card">
+            <i class="ri-folder-chart-line"></i>
+            <div><div class="link-card-title">CE Project Portfolio</div><div class="link-card-url">projects.ce.pdn.ac.lk</div></div>
+            <i class="ri-arrow-right-line arrow"></i>
+          </a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ════════════════════ FOOTER ════════════════════ -->
+  <footer>
+    <div class="container">
+      <p class="mb-2" style="font-size:1.1rem;">🏗️ <strong style="color:var(--text)">Voice-Enabled LLM Agentic Construction Scheduler</strong></p>
+      <p class="mb-1">E20 Final Year Research Project · Department of Computer Engineering · University of Peradeniya</p>
+      <p class="mt-3" style="font-size:0.78rem; color:#475569;">
+        © 2026 · Built using LangGraph, Neo4j, FastAPI & React
+      </p>
+    </div>
+  </footer>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script>
+    // ── Active nav link highlight ──
+    const navLinks = document.querySelectorAll('.nav-link');
+    const sections = document.querySelectorAll('section[id]');
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting) {
+          navLinks.forEach(l => l.classList.remove('active'));
+          const active = document.querySelector(`.nav-link[href="#${e.target.id}"]`);
+          if (active) active.classList.add('active', 'text-primary');
+        }
+      });
+    }, { threshold: 0.4 });
+    sections.forEach(s => observer.observe(s));
+
+    // ── Light / Dark mode toggle ──
+    const toggleBtn = document.getElementById('theme-toggle');
+    const html = document.documentElement;
+
+    // Load saved preference
+    const saved = localStorage.getItem('theme') || 'dark';
+    html.setAttribute('data-theme', saved);
+    toggleBtn.textContent = saved === 'dark' ? '🌙' : '☀️';
+
+    toggleBtn.addEventListener('click', () => {
+      const current = html.getAttribute('data-theme');
+      const next = current === 'dark' ? 'light' : 'dark';
+      html.setAttribute('data-theme', next);
+      toggleBtn.textContent = next === 'dark' ? '🌙' : '☀️';
+      localStorage.setItem('theme', next);
+    });
+  </script>
+</body>
+</html>
