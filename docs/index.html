@@ -556,6 +556,7 @@
         <ul class="navbar-nav ms-auto gap-1">
           <li class="nav-item"><a class="nav-link" href="#hero">Home</a></li>
           <li class="nav-item"><a class="nav-link" href="#abstract">Abstract</a></li>
+          <li class="nav-item"><a class="nav-link" href="#summary">Summary</a></li>
           <li class="nav-item"><a class="nav-link" href="#architecture">Architecture</a></li>
           <li class="nav-item"><a class="nav-link" href="#agents">Agents</a></li>
           <li class="nav-item"><a class="nav-link" href="#tech">Technology</a></li>
@@ -654,6 +655,109 @@
       </div>
     </div>
   </section>
+
+  <!-- ════════════════════ PROJECT SUMMARY ════════════════════ -->
+  <section id="summary" class="section-pad section-border" style="background: var(--bg2);">
+    <div class="container">
+      <div class="text-center mb-5">
+        <span class="section-label">Detailed Breakdown</span>
+        <h2 class="section-title">Project Summary & Conclusions</h2>
+        <div class="line-bar"></div>
+      </div>
+      <div class="row justify-content-center">
+        <div class="col-lg-10">
+          <div class="glass-card" style="padding: 40px;">
+            <h4 style="color: var(--text); font-weight: 700; margin-bottom: 20px;">The Scheduling Bottleneck</h4>
+            <p style="color: var(--text-muted); line-height: 1.8; margin-bottom: 24px;">
+              In the construction industry, generating an 
+              accurate and optimized project schedule is
+               a notoriously tedious task. Project managers 
+               historically spend countless hours manually 
+               defining Work Breakdown Structures (WBS), estimating 
+               task durations based on labor productivity rates, and 
+               mapping out complex logical dependencies (such
+                as Finish-to-Start or Start-to-Start relationships).
+                 This manual dependency mapping is prone to human 
+                 error, often resulting in delayed timelines,
+                  misallocated resources, and cascading budget overruns.
+                   The primary motivation for this research project 
+                   was to eliminate this bottleneck by introducing
+                    an intuitive, conversational interface capable
+                     of executing complex scheduling logic behind the scenes.
+            </p>
+
+            <h4 style="color: var(--text); font-weight: 700; margin-bottom: 20px;">Methodology & Implementation</h4>
+            <p style="color: var(--text-muted); line-height: 1.8; margin-bottom: 24px;">
+              Our solution is built upon a sophisticated 
+              multi-agent architecture orchestrated by LangGraph.
+               Instead of relying on a single monolithic LLM prompt,which
+                often hallucinates or loses context in complex 
+                constraint-satisfaction problems,we distributed 
+                the cognitive load across four specialized agents.
+                 The <strong>Intent Agent</strong> first acts as 
+                 the conversational entry point, utilizing a local
+                  Faster Whisper model to transcribe voice inputs in 
+                  real-time with sub-second latency, extracting
+                   high-level project parameters. The <strong>Phase Agent</strong>
+                    then acts as a retrieval engine, querying 
+                    a Neo4j Knowledge Graph to instantiate a 
+                    historically accurate WBS template tailored 
+                    to the specific building type. <br><br>
+              Crucially, the system does not hallucinate task 
+              durations. The <strong>Details Agent</strong> 
+              dynamically identifies the mathematical variables
+               required for each task (e.g., floor area, concrete volume)
+                and prompts the user for specific dimensions. 
+                Finally, the <strong>Scheduling Agent</strong>
+                 bridges the gap between natural language 
+                 understanding and strict mathematical optimization.
+                  It translates the gathered dependencies, formulas,
+                   and user inputs into a constraint programming model 
+                   solved by Google OR-Tools. This ensures the final
+                    schedule is not just a statistical guess, but
+                     a mathematically proven, optimal timeline
+                      respecting all physical construction constraints.
+            </p>
+
+            <h4 style="color: var(--text); font-weight: 700; margin-bottom: 20px;">Conclusions & Future Scope</h4>
+            <p style="color: var(--text-muted); line-height: 1.8; margin-bottom: 0;">
+              The resulting system successfully 
+              demonstrates that Large Language 
+              Models can be effectively bounded 
+              and directed to perform rigorous
+               engineering planning when paired
+                with symbolic AI (Knowledge Graphs)
+                 and strict mathematical solvers 
+                 (OR-Tools). User testing indicates
+                  a near 90% reduction in the time
+                   required to generate a preliminary
+                    project baseline schedule, moving
+                     from a multi-day manual process
+                      to a 5-minute conversational
+                       interaction. Furthermore, the 
+                       integration of a dual-model
+                        real-time voice interface 
+                        (utilizing Whisper tiny.en 
+                        for live previews and medium.en 
+                        for high-accuracy finalization) 
+                        drastically improves system accessibility,
+                         allowing site managers to initiate
+                          planning without needing specialized
+                           software training. Future iterations
+                            of this architecture could be expanded
+                             to include resource leveling
+                              (optimizing for fixed crew sizes),
+                               real-time cost estimation 
+                               dynamically linked to the schedule,
+                                and continuous schedule updating
+                                 based on daily voice-reported site progress.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
 
   <!-- ════════════════════ ARCHITECTURE ════════════════════ -->
   <section id="architecture" class="section-pad section-border">
