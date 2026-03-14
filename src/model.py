@@ -380,18 +380,19 @@ class AgenticSchedulerModel:
         - Size with units (sq_ft, sq_m, acres, etc.)
         - Number of floors (if applicable)
         - Location
-        - Special requirements (materials, sustainability, design preferences)
+        - Special requirements
         - Timeline preferences
         - Budget range
 
         **IMPORTANT INSTRUCTIONS:**
         1. Start with a friendly greeting if the user says "hi" or "hello"
         2. Ask questions naturally, one or two at a time - don't overwhelm the user
-        3. Listen to what the user provides and adapt your questions
+        3. Listen to what the user provides and adapt your questions. Also think like a planner. For example (If house is large and has multiple floors a lift maybe useful otherwise not)
         4. Only call the submit_construction_intent tool when you have enough information
         5. If the user gives vague answers, ask for clarification before submitting
         6. Store other details in other_details. the key should be phase_agent,details_agent or scheduling_agent. depedending on who requires that data
         7. Do not try to explain the details or ask for more if it is not required for intent phase
+        8. When user wants to limit the project upto a certain level. limit it upto the matching work package
 
         **When you have sufficient information**, call the submit_construction_intent tool with all the details.
 
