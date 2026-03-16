@@ -1,4 +1,4 @@
-all_runs = [
+all_runs_sys = [
     {
         "Run 1": [
             "Anti-termite Treatment",
@@ -237,6 +237,181 @@ all_runs = [
             "Setting Out",
             "Waterproofing for Blinding",
             "Waterproofing for Footing and Column Neck",
+        ]
+    },
+]
+
+all_runs = [
+    {
+        "Run 1": [
+            "Excavate foundation trenches",
+            "Subgrade preparation and compaction",
+            "Install footing formwork",
+            "Place footing reinforcement",
+            "Pour footing concrete",
+            "Cure footing concrete",
+            "Backfill around footings",
+            "Foundation inspection and sign-off",
+        ],
+    },
+    {
+        "Run 2": [
+            "Excavate Foundation Trench",
+            "Excavate Footing Trench",
+            "Backfill Foundation Trench",
+            "Compact Subgrade",
+            "Formwork for Footings",
+            "Reinforcement for Footings",
+            "Pour Footings",
+            "Curing of Footings",
+            "Remove Formwork",
+        ]
+    },
+    {
+        "Run 3": [
+            "Define project scope",
+            "Site survey",
+            "Geotechnical/soil investigation",
+            "Permits and approvals",
+            "Utility coordination",
+            "Establish baseline schedule and budget",
+            "Site clearance",
+            "Grading and leveling",
+            "Erosion/sediment control",
+            "Temporary access and staging",
+            "Material storage setup",
+            "Excavate foundation trenches",
+            "Excavate footings trenches",
+            "Remove spoil and unsuitable material",
+            "Subgrade compaction",
+            "Site safety checks" "Install footings formwork",
+            "Place reinforcement for footings",
+            "Pour concrete for footings",
+            "Cure footings",
+            "Strip footings formwork",
+            "Footing inspection",
+        ]
+    },
+    {
+        "Run 4": [
+            "Site survey and layout",
+            "Permits and approvals",
+            "Temporary utilities setup",
+            "Site access and security measures",
+            "Clear vegetation and debris",
+            "Remove topsoil",
+            "Rough grade and compaction",
+            "Erosion and sediment control",
+            "Mark foundation lines",
+            "Excavate foundation trenches",
+            "Verify depths and alignment",
+            "Setup footing formwork",
+            "Place footing reinforcement",
+            "Pour footing concrete",
+            "Cure footing",
+            "Backfill around footings",
+        ]
+    },
+    {
+        "Run 5": [
+            "Clear site",
+            "Set out foundation lines",
+            "Establish temporary facilities",
+            "Install site drainage",
+            "Site survey and levels",
+            "Install footing formwork",
+            "Place reinforcement bars",
+            "Tie and secure reinforcement",
+            "Pour footing concrete",
+            "Vibrate footing concrete",
+            "Cure footing concrete",
+            "Backfill around footings",
+            "Compact backfill",
+            "Restore site grade",
+        ]
+    },
+    {
+        "Run 6": [
+            "Site survey and layout",
+            "Clear site",
+            "Set up temporary facilities",
+            "Provide site access and security",
+            "Install temporary utilities",
+            "Material storage and protection",
+            "Mark foundation layout",
+            "Excavate foundation trenches",
+            "Excavate footing trenches",
+            "Prepare trench base and compact subgrade",
+            "Set up formwork for footings",
+            "Place reinforcement for footings",
+            "Pour footings concrete",
+            "Cure footings",
+            "Strip/Remove footing formwork",
+        ]
+    },
+    {
+        "Run 7": [
+            "Site clearance",
+            "Set-out / Building lines",
+            "Establish temporary access",
+            "Site facilities setup",
+            "Excavate foundation trenches",
+            "Excavate footing pits (footings)",
+            "Compact subgrade",
+            "Place base course / granular fill",
+            "Finish trench bottoms",
+            "Construct footing formwork",
+            "Place footing reinforcement",
+            "Pour footing concrete",
+            "Cure footing concrete",
+            "Remove footing formwork and backfill around footings",
+        ]
+    },
+    {
+        "Run 8": [
+            "Site survey and layout",
+            "Clearance and grubbing",
+            "Temporary fencing and safety setup",
+            "Site access and utilities setup",
+            "Install formwork for footings",
+            "Place reinforcement for footings",
+            "Pour concrete for footings",
+            "Cure footing",
+            "Backfill around footings",
+        ]
+    },
+    {
+        "Run 9": [
+            "Site clearance",
+            "Setout foundations",
+            "Temporary facilities setup",
+            "Excavate foundation trenches",
+            "Dispose or stockpile excavated material",
+            "Compact trench base",
+            "Formwork for footings",
+            "Reinforcement for footings",
+            "Pour footing concrete",
+            "Cure footing concrete",
+            "Backfill around footings and compact",
+        ]
+    },
+    {
+        "Run 10": [
+            "Site clearance",
+            "Set-out and layout",
+            "Survey boundaries",
+            "Temporary access and safety",
+            "Excavate foundation trenches",
+            "Excavate footing pits",
+            "Dewatering",
+            "Subgrade preparation and compaction",
+            "Formwork for footings",
+            "Footing reinforcement",
+            "Pour concrete for footings",
+            "Curing of footings",
+            "Remove formwork",
+            "Backfill around foundation",
+            "Compact backfill",
         ]
     },
 ]

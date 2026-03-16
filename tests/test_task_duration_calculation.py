@@ -40,10 +40,10 @@ MOCK_TASK_RECORDS = [
     },
     {
         "name": "Blockwork Wall",
-        "task_duration": "({length} * {height}) / {productivity}", # Multi-variable formula
+        "task_duration": "({length} * {height}) / {productivity}",  # Multi-variable formula
         "productivity": 12.0,  # 12 m2 per day
-        "unit": "m2"
-    }
+        "unit": "m2",
+    },
 ]
 
 # Mock inputs to test the LLM extraction
@@ -60,24 +60,20 @@ EXTRACTION_TEST_CASES = [
         "question_text": "1. What is the volume of concrete required in m3 for the RC Footing Concrete?\n2. What is the area of the formwork required in m2?",
         "task_summary_lines": [
             "- RC Footing Concrete: needs values for: volume",
-            "- Formwork: needs values for: area"
+            "- Formwork: needs values for: area",
         ],
         "user_input": "Footing concrete volume is 45m3, and formwork area is 120 square meters.",
         "expected_values": {
             "RC Footing Concrete": {"volume": 45.0},
-            "Formwork": {"area": 120.0}
+            "Formwork": {"area": 120.0},
         },
     },
     {
         "description": "Multi-variable task and conversational response",
         "question_text": "1. For the Blockwork Wall, what is the total length in meters and the height in meters?",
-        "task_summary_lines": [
-            "- Blockwork Wall: needs values for: length, height"
-        ],
+        "task_summary_lines": ["- Blockwork Wall: needs values for: length, height"],
         "user_input": "The wall will be 50 meters long and 3 meters high.",
-        "expected_values": {
-            "Blockwork Wall": {"length": 50.0, "height": 3.0}
-        },
+        "expected_values": {"Blockwork Wall": {"length": 50.0, "height": 3.0}},
     },
     {
         "description": "Highly complex grouped response with shared values",
@@ -85,15 +81,15 @@ EXTRACTION_TEST_CASES = [
         "task_summary_lines": [
             "- Excavation: needs values for: volume",
             "- RC Footing Concrete: needs values for: volume",
-            "- Blockwork Wall: needs values for: length, height"
+            "- Blockwork Wall: needs values for: length, height",
         ],
         "user_input": "Excavation and footing concrete both need 60 cubes. The wall is 100m long and stands 2.5m tall.",
         "expected_values": {
             "Excavation": {"volume": 60.0},
             "RC Footing Concrete": {"volume": 60.0},
-            "Blockwork Wall": {"length": 100.0, "height": 2.5}
+            "Blockwork Wall": {"length": 100.0, "height": 2.5},
         },
-    }
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -135,7 +131,7 @@ def test_variable_extraction_accuracy():
         )
 
         structured_llm = model.llm.with_structured_output(TaskVariableValues)
-        parsed_values: TaskVariableValues = structured_llm.invoke([parse_prompt]) # type: ignore
+        parsed_values: TaskVariableValues = structured_llm.invoke([parse_prompt])  # type: ignore
 
         # Convert to a flat dictionary for easy comparison
         extracted = {}
@@ -175,6 +171,7 @@ def test_deterministic_duration_calculation():
         "Excavation": {"volume": 100.0},  # 100 / 15 = 6.66 -> 7 days
         "RC Footing Concrete": {"volume": 40.0},  # 40 / 20 = 2 -> 2 days
         "Formwork": {"area": 200.0},  # (200 * 1.5) / 50 = 6 -> 6 days
+        "Blockwork Wall": {"length": 100.0, "height": 2.5},  #
     }
 
     # _calculate_task_durations is an internal method in phase_node closure
@@ -212,6 +209,7 @@ def test_deterministic_duration_calculation():
         "Excavation": 7,  # 100/15 = 6.66... ceil is 7
         "RC Footing Concrete": 2,  # 40/20 = 2.0 ceil is 2
         "Formwork": 6,  # (200 * 1.5) / 50 = 6.0 ceil is 6
+        "Blockwork Wall": 21,
     }
 
     for task in computed_tasks:

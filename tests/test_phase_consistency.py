@@ -44,7 +44,9 @@ RESIDENTIAL_INTENT = ConstructionIntent(
     special_requirements=[],
     timeline_preference="12 months",
     budget_range={},
-    other_details={"phase_agent": "limit the scheduling upto foundation phase"},
+    other_details={
+        "phase_agent": "limit the scheduling upto foundation earth work and footings"
+    },
 )
 
 # ---------------------------------------------------------------------------
@@ -124,6 +126,53 @@ def _run_once_and_get_subtasks(
     return tasks_by_phase
 
 
+from pydantic import BaseModel, Field
+
+
+class BaselinePhase(BaseModel):
+    phase_name: str = Field(
+        description="Name of the construction phase, like 'Foundation' or 'Framing'"
+    )
+    tasks: list[str] = Field(description="List of task names for this phase")
+
+
+class BaselinePhaseTasks(BaseModel):
+    phases: list[BaselinePhase] = Field(
+        description="A list of construction phases, each containing a list of task names."
+    )
+
+
+def _run_baseline_llm(
+    model: AgenticSchedulerModel, intent: ConstructionIntent
+) -> dict[str, list[str]]:
+    """
+    Run a direct LLM prompt to generate a WBS without the Knowledge Graph.
+    Uses structured output to get a dictionary of phases to tasks.
+    """
+    structured_llm = model.llm.with_structured_output(BaselinePhaseTasks)
+
+    prompt = f"""You are an expert construction project planner.
+            Given the following project intent, break it down into standard construction phases and list the main tasks for each phase. 
+            Do not rely on any specific existing templates, just use your general knowledge.
+
+            Project Type: {intent.project_type}
+            Building Category: {intent.building_category}
+            Size: {intent.size}
+            Floors: {intent.floors}
+            Location: {intent.location}
+            Special Requirements: {intent.special_requirements}
+            Timeline: {intent.timeline_preference}
+            other_details={"limit the scheduling upto foundation earth work and footings"}
+
+            Return a structured output with phase names and lists of task names.
+            Keep task names concise and standard (e.g., "Excavate Foundation", "Pour Concrete").
+            """
+    result = structured_llm.invoke(prompt)
+    if hasattr(result, "phases"):
+        return {p.phase_name: p.tasks for p in result.phases}
+    return {}
+
+
 def _average_pairwise_jaccard(sets: list[set]) -> float:
     """Average pairwise Jaccard similarity across multiple sets.
     This is much less sensitive to single-run outliers than intersection/union.
@@ -137,8 +186,8 @@ def _average_pairwise_jaccard(sets: list[set]) -> float:
 
     total_score = 0.0
     for s1, s2 in pairs:
-        intersection = set.intersection(s1, s2)
-        union = set.union(s1, s2)
+        intersection = s1.intersection(s2)
+        union = s1.union(s2)
         score = len(intersection) / len(union) if union else 1.0
         total_score += score
 
@@ -224,14 +273,35 @@ if __name__ == "__main__":
     for name, intent in intents.items():
         print(f"\n\n🔄 Testing: {name}")
         all_runs: list[dict[str, list[str]]] = []
+        all_baseline_runs: list[dict[str, list[str]]] = []
 
         for i in range(NUM_RUNS):
             print(f"\n--- Run {i + 1}/{NUM_RUNS} ---")
             try:
-                tasks_by_phase = _run_once_and_get_subtasks(mdl, intent)
-                for phase, tasks in tasks_by_phase.items():
-                    print(f"  [{phase}] → {tasks}")
-                all_runs.append(tasks_by_phase)
+                # 1. Run System (with KG)
+                # tasks_by_phase = _run_once_and_get_subtasks(mdl, intent)
+                # print("  [System KG Tasks]")
+                # system_tasks_flat = set()
+                # for phase, tasks in tasks_by_phase.items():
+                #     print(f"    [{phase}] → {tasks}")
+                #     system_tasks_flat.update(tasks)
+                # all_runs.append(tasks_by_phase)
+
+                # 2. Run Baseline (Direct LLM)
+                baseline_tasks_by_phase = _run_baseline_llm(mdl, intent)
+                print("  [Baseline LLM Tasks]")
+                baseline_tasks_flat = set()
+                for phase, tasks in baseline_tasks_by_phase.items():
+                    print(f"    [{phase}] → {tasks}")
+                    baseline_tasks_flat.update(tasks)
+                all_baseline_runs.append(baseline_tasks_by_phase)
+
+                # 3. Compare Jaccard Similarity (System vs Baseline)
+                # intersection = system_tasks_flat.intersection(baseline_tasks_flat)
+                # union = system_tasks_flat.union(baseline_tasks_flat)
+                # jaccard = len(intersection) / len(union) if union else 1.0
+                # print(f"  📊 Jaccard Similarity (System vs Baseline): {jaccard:.3f}")
+
             except Exception as e:
                 print(f"  ⚠️ Run {i + 1} failed: {e}")
                 print(
@@ -239,6 +309,7 @@ if __name__ == "__main__":
                 )
                 break
 
-        _print_consistency_report(name, all_runs)
+        # _print_consistency_report(f"{name} (System KG)", all_runs)
+        _print_consistency_report(f"{name} (Baseline LLM)", all_baseline_runs)
 
     print("\n✅ Done!")
