@@ -6,12 +6,17 @@ Exposes the AgenticSchedulerModel via HTTP endpoints with SSE streaming.
 import uuid
 import json
 import asyncio
+import os
+import tempfile
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel as PydanticBaseModel
+from openai import OpenAI
+
+WhisperModel = None
 
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langgraph.types import Command
@@ -20,6 +25,77 @@ from langchain_core.runnables import RunnableConfig
 from src.model import AgenticSchedulerModel, WorkflowStage, AgentState
 
 app = FastAPI(title="Construction Scheduler API")
+
+# --- Transcription backend configuration ---
+# Default backend is OpenAI transcription API.
+# Set TRANSCRIBE_BACKEND=faster_whisper if you want local transcription.
+TRANSCRIBE_BACKEND = os.getenv("TRANSCRIBE_BACKEND", "openai").lower()
+
+# OpenAI transcription settings
+OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
+OPENAI_TRANSCRIBE_FAST_MODEL = os.getenv(
+    "OPENAI_TRANSCRIBE_FAST_MODEL", OPENAI_TRANSCRIBE_MODEL
+)
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Faster-Whisper settings (used only when TRANSCRIBE_BACKEND=faster_whisper)
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
+WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "float16")
+WHISPER_MAIN_MODEL = os.getenv("WHISPER_MAIN_MODEL", "large-v3-turbo")
+WHISPER_FAST_MODEL = os.getenv("WHISPER_FAST_MODEL", "distil-large-v3")
+
+whisper_model_fast = None
+whisper_model = None
+
+
+def _load_whisper_model(model_name: str):
+    global WhisperModel
+    if WhisperModel is None:
+        try:
+            from faster_whisper import WhisperModel as _WhisperModel
+
+            WhisperModel = _WhisperModel
+        except Exception as import_error:
+            raise RuntimeError(
+                "faster-whisper is not available. Install it or set TRANSCRIBE_BACKEND=openai"
+            ) from import_error
+
+    try:
+        print(
+            f"[Whisper] Loading '{model_name}' on {WHISPER_DEVICE} ({WHISPER_COMPUTE_TYPE})..."
+        )
+        return WhisperModel(
+            model_name,
+            device=WHISPER_DEVICE,
+            compute_type=WHISPER_COMPUTE_TYPE,
+        )
+    except Exception as gpu_error:
+        print(
+            f"[Whisper] GPU load failed for '{model_name}': {gpu_error}. Falling back to CPU int8."
+        )
+        return WhisperModel(model_name, device="cpu", compute_type="int8")
+
+
+def _ensure_whisper_models_loaded():
+    global whisper_model_fast, whisper_model
+    if whisper_model_fast is None:
+        whisper_model_fast = _load_whisper_model(WHISPER_FAST_MODEL)
+    if whisper_model is None:
+        whisper_model = _load_whisper_model(WHISPER_MAIN_MODEL)
+
+
+def _transcribe_with_openai(file_path: str, model_name: str) -> str:
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("OPENAI_API_KEY is missing for OpenAI transcription")
+
+    with open(file_path, "rb") as audio_file:
+        response = openai_client.audio.transcriptions.create(
+            model=model_name,
+            file=audio_file,
+            language="en",
+        )
+
+    return (response.text or "").strip()
 
 # CORS for React frontend
 app.add_middleware(
@@ -289,6 +365,83 @@ async def get_state(thread_id: str):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/transcribe")
+async def transcribe_audio(audio: UploadFile = File(...)):
+    """
+    Transcribe audio using Faster Whisper.
+    Accepts WebM/WAV audio from the browser MediaRecorder.
+    Returns: { "text": "transcribed text" }
+    """
+    loop = asyncio.get_event_loop()
+
+    # Save uploaded audio to a temp file
+    suffix = ".webm"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, mode='wb') as tmp:
+        content = await audio.read()
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    try:
+        def run_transcribe():
+            if TRANSCRIBE_BACKEND == "openai":
+                return _transcribe_with_openai(tmp_path, OPENAI_TRANSCRIBE_MODEL)
+
+            _ensure_whisper_models_loaded()
+            segments, _ = whisper_model.transcribe(  # type: ignore[union-attr]
+                tmp_path,
+                beam_size=5,
+                language="en",
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500),
+            )
+            return " ".join(seg.text.strip() for seg in segments)
+
+        text = await loop.run_in_executor(None, run_transcribe)
+        return {"text": text.strip()}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Transcription error: {e}")
+
+    finally:
+        os.unlink(tmp_path)  # always clean up the temp file
+
+
+@app.post("/api/transcribe/interim")
+async def transcribe_audio_interim(audio: UploadFile = File(...)):
+    """
+    Ultra-fast transcription for live preview chunks while recording.
+    Uses a fast model for low-latency interim transcription.
+    """
+    loop = asyncio.get_event_loop()
+    suffix = ".webm"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, mode='wb') as tmp:
+        content = await audio.read()
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    try:
+        def run_fast_transcribe():
+            if TRANSCRIBE_BACKEND == "openai":
+                return _transcribe_with_openai(tmp_path, OPENAI_TRANSCRIBE_FAST_MODEL)
+
+            _ensure_whisper_models_loaded()
+            segments, _ = whisper_model_fast.transcribe(  # type: ignore[union-attr]
+                tmp_path,
+                beam_size=1,
+                language="en",
+            )
+            return " ".join(seg.text.strip() for seg in segments)
+
+        text = await loop.run_in_executor(None, run_fast_transcribe)
+        return {"text": text.strip()}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Interim transcription error: {e}")
+
+    finally:
+        os.unlink(tmp_path)
 
 
 if __name__ == "__main__":

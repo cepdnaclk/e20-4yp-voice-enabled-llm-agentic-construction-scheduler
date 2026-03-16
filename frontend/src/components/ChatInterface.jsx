@@ -1,10 +1,12 @@
 import { useRef, useEffect } from 'react';
 import MessageBubble from './MessageBubble';
+import useVoiceInput from './useVoiceInput';
 import './ChatInterface.css';
 
 function ChatInterface({ messages, onSend, isLoading, isInitializing, pendingInterrupt, currentStage, hasStarted }) {
     const messagesEndRef = useRef(null);
     const inputRef = useRef(null);
+    const { isListening, isTranscribing, isSupported, toggleListening } = useVoiceInput(inputRef, null);
 
     // Auto-scroll to bottom
     useEffect(() => {
@@ -39,11 +41,13 @@ function ChatInterface({ messages, onSend, isLoading, isInitializing, pendingInt
 
     const inputPlaceholder = isInitializing
         ? 'Connecting...'
-        : pendingInterrupt
-            ? 'Type your response...'
-            : hasStarted
-                ? 'Type a message...'
-                : 'Describe your construction project...';
+        : isTranscribing
+            ? 'Transcribing your speech...'
+            : pendingInterrupt
+                ? 'Type or speak your response...'
+                : hasStarted
+                    ? isSupported ? 'Type or 🎤 speak a message...' : 'Type a message...'
+                    : isSupported ? 'Describe your project (or click 🎤 to speak)...' : 'Describe your construction project...';
 
     // ── HERO / WELCOME SCREEN (before first message) ──────────────────────────
     if (!hasStarted) {
@@ -69,6 +73,27 @@ function ChatInterface({ messages, onSend, isLoading, isInitializing, pendingInt
                     <div className="hero-input-wrap">
                         <form onSubmit={handleSubmit} className="input-form">
                             <div className="input-wrapper">
+                                {isSupported && (
+                                    <button
+                                        type="button"
+                                        onClick={toggleListening}
+                                        disabled={isLoading || isInitializing}
+                                        className={`mic-btn${isListening ? ' listening' : ''}${isTranscribing ? ' transcribing' : ''}`}
+                                        title={isTranscribing ? 'Transcribing...' : isListening ? 'Stop recording' : 'Start voice input'}
+                                        aria-label={isTranscribing ? 'Transcribing...' : isListening ? 'Stop recording' : 'Start voice input'}
+                                    >
+                                        {isTranscribing ? (
+                                            <span style={{fontSize:'14px'}}>⏳</span>
+                                        ) : (
+                                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                                            <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                                            <line x1="12" y1="19" x2="12" y2="23"/>
+                                            <line x1="8" y1="23" x2="16" y2="23"/>
+                                        </svg>
+                                        )}
+                                    </button>
+                                )}
                                 <textarea
                                     ref={inputRef}
                                     rows={1}
@@ -140,6 +165,27 @@ function ChatInterface({ messages, onSend, isLoading, isInitializing, pendingInt
             <div className="input-area">
                 <form onSubmit={handleSubmit} className="input-form">
                     <div className="input-wrapper">
+                        {isSupported && (
+                            <button
+                                type="button"
+                                onClick={toggleListening}
+                                disabled={isLoading || isInitializing}
+                                className={`mic-btn${isListening ? ' listening' : ''}${isTranscribing ? ' transcribing' : ''}`}
+                                title={isTranscribing ? 'Transcribing...' : isListening ? 'Stop recording' : 'Start voice input'}
+                                aria-label={isTranscribing ? 'Transcribing...' : isListening ? 'Stop recording' : 'Start voice input'}
+                            >
+                                {isTranscribing ? (
+                                    <span style={{fontSize:'14px'}}>⏳</span>
+                                ) : (
+                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                    <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                                    <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                                    <line x1="12" y1="19" x2="12" y2="23"/>
+                                    <line x1="8" y1="23" x2="16" y2="23"/>
+                                </svg>
+                                )}
+                            </button>
+                        )}
                         <textarea
                             ref={inputRef}
                             rows={1}
